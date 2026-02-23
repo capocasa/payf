@@ -1,0 +1,17 @@
+# Nim build artifacts
+nimcache/
+*.exe
+/payf
+
+# Config with secrets
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+# Dev notes
+STATUS.md
+
+# Test binaries
+tests/test_fints

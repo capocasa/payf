@@ -1,0 +1,768 @@
+## FinTS 3.0 library for SEPA instant transfers
+##
+## Implements the minimal subset needed for HKIPZ (Einzelne SEPA-Instant-Überweisung)
+## Reference: FinTS 3.0 specification and python-fints
+
+import std/[httpclient, base64, strutils, strformat, times]
+import std/net
+
+const
+  FintsVersion* = "300"
+  HbciVersion* = 300
+  ProductId* = "5D8519C8F4024026D066D6661"  # Registered FinTS product ID
+
+type
+  FintsError* = object of CatchableError
+
+  TanMethod* = object
+    id*: string
+    name*: string
+    version*: int
+    processType*: int  # 1=one-step, 2=two-step, 4=decoupled
+
+  BankParams* = object
+    bpdVersion*: int
+    updVersion*: int
+    supportedTanMethods*: seq[TanMethod]
+    supportsInstantPayment*: bool
+
+  Account* = object
+    iban*: string
+    bic*: string
+    number*: string
+    subaccount*: string
+    blz*: string
+    holder*: string
+
+  FintsClient* = object
+    url*: string
+    blz*: string
+    user*: string
+    pin*: string
+    productId*: string
+    productVersion*: string
+    account*: Account
+    dialogId*: string
+    msgNum*: int
+    systemId*: string
+    bankParams*: BankParams
+    selectedTanMethod*: string
+    debug*: bool
+    http: HttpClient
+
+  TransferRequest* = object
+    recipientName*: string
+    recipientIban*: string
+    recipientBic*: string
+    amount*: float
+    currency*: string
+    reference*: string
+    instant*: bool
+
+  TransferResult* = object
+    success*: bool
+    tanRequired*: bool
+    tanChallenge*: string
+    tanMediaName*: string
+    orderRef*: string
+    errorCode*: string
+    errorMsg*: string
+
+# Forward declarations
+proc buildSegment(name: string, version, num: int, data: seq[string]): string
+proc escapeFintsData*(s: string): string
+proc parseSegments(msg: string): seq[tuple[name: string, version, num: int, data: seq[string]]]
+
+# --- Utility functions ---
+
+proc generateReference(): string =
+  ## Generate a message reference
+  let now = now()
+  result = now.format("yyyyMMddHHmmss")
+
+proc escapeFintsData*(s: string): string =
+  ## Escape special characters in FinTS segment data: ? + : ' @
+  result = s
+  result = result.replace("?", "??")
+  result = result.replace("+", "?+")
+  result = result.replace(":", "?:")
+  result = result.replace("'", "?'")
+  result = result.replace("@", "?@")
+
+proc escapeXml*(s: string): string =
+  ## Escape special characters for XML content: & < > " '
+  result = s
+  result = result.replace("&", "&amp;")
+  result = result.replace("<", "&lt;")
+  result = result.replace(">", "&gt;")
+  result = result.replace("\"", "&quot;")
+  result = result.replace("'", "&apos;")
+
+proc unescapeFintsData*(s: string): string =
+  ## Unescape FinTS data
+  result = ""
+  var i = 0
+  while i < s.len:
+    if i + 1 < s.len and s[i] == '?':
+      result.add(s[i + 1])
+      i += 2
+    else:
+      result.add(s[i])
+      i += 1
+
+proc formatAmount*(amount: float): string =
+  ## Format amount with comma decimal separator (German format)
+  let parts = ($amount).split('.')
+  if parts.len == 2:
+    result = parts[0] & "," & parts[1].alignLeft(2, '0')[0..1]
+  else:
+    result = parts[0] & ",00"
+
+# --- Segment building ---
+
+proc buildSegment(name: string, version, num: int, data: seq[string]): string =
+  ## Build a FinTS segment, omitting trailing empty fields
+  let header = fmt"{name}:{num}:{version}"
+  if data.len > 0:
+    # Find last non-empty element
+    var lastNonEmpty = -1
+    for i in countdown(data.len - 1, 0):
+      if data[i].len > 0:
+        lastNonEmpty = i
+        break
+    if lastNonEmpty >= 0:
+      result = header & "+" & data[0..lastNonEmpty].join("+") & "'"
+    else:
+      result = header & "'"
+  else:
+    result = header & "'"
+
+proc buildHNHBK(msgLen: int, dialogId: string, msgNum: int): string =
+  ## Message header segment (Nachrichtenkopf)
+  ## Format: HNHBK:1:3+msgLen(12)+hbciVersion+dialogId+msgNum'
+  let lenStr = align($msgLen, 12, '0')  # 12 digits, zero-padded
+  let data = @[
+    lenStr,
+    $HbciVersion,
+    dialogId,
+    $msgNum
+  ]
+  result = buildSegment("HNHBK", 3, 1, data)
+
+proc buildHNHBS(msgNum, segNum: int): string =
+  ## Message end segment (Nachrichtenabschluss)
+  let data = @[$msgNum]
+  result = buildSegment("HNHBS", 1, segNum, data)
+
+proc buildHNVSK(blz, user, systemId: string): string =
+  ## Encryption header segment (Verschluesselungskopf) for PIN/TAN
+  ## Uses "dummy" encryption - no actual encryption
+  let now = now()
+  let dateStr = now.format("yyyyMMdd")
+  let timeStr = now.format("HHmmss")
+  let data = @[
+    "PIN:1",                       # Security profile
+    "998",                         # Security function (998=PIN/TAN encryption)
+    "1",                           # Security role (1=ISS)
+    "2::" & systemId,              # Security identification
+    "1:" & dateStr & ":" & timeStr, # Security date/time
+    "2:2:13:@8@00000000:5:1",      # Encryption algorithm (2-key 3DES, CBC)
+    "280:" & blz & ":" & escapeFintsData(user) & ":V:0:0",  # Key name
+    "0"                            # Compression (0=none)
+  ]
+  result = buildSegment("HNVSK", 3, 998, data)
+
+proc buildHNVSD(encryptedData: string): string =
+  ## Encrypted data segment (Verschluesselte Daten)
+  ## Contains the signed segments as "encrypted" binary data
+  result = "HNVSD:999:1+@" & $encryptedData.len & "@" & encryptedData & "'"
+
+proc buildHNSHK(segNum: int, secFunc, secRef: string, blz, user, systemId: string): string =
+  ## Security header (Sicherheitskopf) for PIN/TAN
+  ## Format based on FinTS 3.0 spec and working implementations
+  let escapedUser = escapeFintsData(user)
+  let secData = @[
+    "PIN:1",                       # Security profile (PIN version 1)
+    secFunc,                       # Security function (999=single step)
+    secRef,                        # Security reference
+    "1",                           # Security area (1=SHM)
+    "1",                           # Security role (1=ISS)
+    "2::" & systemId,              # Security identification (2=system ID based)
+    "0",                           # Security reference number
+    "1",                           # Security datetime (1=STS)
+    "1:999:1",                     # Hash algorithm
+    "6:10:16",                     # Signature algorithm
+    "280:" & blz & ":" & escapedUser & ":S:0:0"  # Key name (280=Germany)
+  ]
+  result = buildSegment("HNSHK", 4, segNum, secData)
+
+proc buildHNSHA(segNum, hnshkRef: int, pin: string, tanValue: string = ""): string =
+  ## Security footer (Sicherheitsabschluss)
+  ## PIN must be escaped for FinTS special chars
+  var authData = escapeFintsData(pin)
+  if tanValue.len > 0:
+    authData = authData & ":" & escapeFintsData(tanValue)
+
+  let data = @[
+    $hnshkRef,
+    "",
+    authData
+  ]
+  result = buildSegment("HNSHA", 2, segNum, data)
+
+proc buildHKIDN(segNum: int, blz, customerId, systemId: string): string =
+  ## Identification segment (Identifikation)
+  let data = @[
+    "280:" & blz,           # Bank identifier (280=Germany, then BLZ)
+    escapeFintsData(customerId),  # Customer ID (user login)
+    systemId,               # System ID ("0" for new)
+    "1"                     # System ID status (1=ID required)
+  ]
+  result = buildSegment("HKIDN", 2, segNum, data)
+
+proc buildHKVVB(segNum: int, bpdVersion, updVersion: int, lang: int = 0, productVersion: string = "0.1.0"): string =
+  ## Processing preparation segment (Verarbeitungsvorbereitung)
+  let data = @[
+    bpdVersion.intToStr,
+    updVersion.intToStr,
+    lang.intToStr,
+    ProductId,       # Registered product ID
+    productVersion   # Product version
+  ]
+  result = buildSegment("HKVVB", 3, segNum, data)
+
+proc buildHKTAN(segNum: int, tanProcess: string, segmentType: string = "", orderRef: string = "", tanMediaName: string = ""): string =
+  ## TAN process segment (HKTAN version 6)
+  ## tanProcess: "4" = start, "2" = submit TAN, "S" = check decoupled status
+  ## segmentType: for process 4, the segment type needing TAN (e.g., "HKIDN")
+  var data: seq[string]
+  case tanProcess
+  of "4":  # Start TAN process
+    data = @[tanProcess, segmentType, "", "", "", "", "", "", "", "", tanMediaName]
+  of "2":  # Submit TAN
+    data = @[tanProcess, "", "", "", orderRef]
+  of "S":  # Check decoupled status
+    data = @[tanProcess, "", "", "", orderRef]
+  else:
+    data = @[tanProcess]
+  result = buildSegment("HKTAN", 6, segNum, data)
+
+proc buildHKEND(segNum: int, dialogId: string): string =
+  ## Dialog end segment
+  let data = @[dialogId]
+  result = buildSegment("HKEND", 1, segNum, data)
+
+# --- SEPA XML generation ---
+
+proc generatePain001*(transfer: TransferRequest, debtor: Account, messageId: string): string =
+  ## Generate pain.001.001.09 XML for SEPA instant transfer
+  let amountStr = formatAmount(transfer.amount)
+  let now = now()
+  let creationDate = now.format("yyyy-MM-dd'T'HH:mm:ss")
+  let requestedDate = now.format("yyyy-MM-dd")
+
+  result = """<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:pain.001.001.09" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <CstmrCdtTrfInitn>
+    <GrpHdr>
+      <MsgId>""" & messageId & """</MsgId>
+      <CreDtTm>""" & creationDate & """</CreDtTm>
+      <NbOfTxs>1</NbOfTxs>
+      <CtrlSum>""" & amountStr & """</CtrlSum>
+      <InitgPty>
+        <Nm>""" & escapeXml(debtor.holder) & """</Nm>
+      </InitgPty>
+    </GrpHdr>
+    <PmtInf>
+      <PmtInfId>""" & messageId & """-1</PmtInfId>
+      <PmtMtd>TRF</PmtMtd>
+      <BtchBookg>true</BtchBookg>
+      <NbOfTxs>1</NbOfTxs>
+      <CtrlSum>""" & amountStr & """</CtrlSum>
+      <PmtTpInf>
+        <SvcLvl>
+          <Cd>SEPA</Cd>
+        </SvcLvl>"""
+
+  # Add instant payment local instrument if requested
+  if transfer.instant:
+    result.add """
+        <LclInstrm>
+          <Cd>INST</Cd>
+        </LclInstrm>"""
+
+  result.add """
+      </PmtTpInf>
+      <ReqdExctnDt>
+        <Dt>""" & requestedDate & """</Dt>
+      </ReqdExctnDt>
+      <Dbtr>
+        <Nm>""" & escapeXml(debtor.holder) & """</Nm>
+      </Dbtr>
+      <DbtrAcct>
+        <Id>
+          <IBAN>""" & debtor.iban & """</IBAN>
+        </Id>
+      </DbtrAcct>
+      <DbtrAgt>
+        <FinInstnId>
+          <BICFI>""" & debtor.bic & """</BICFI>
+        </FinInstnId>
+      </DbtrAgt>
+      <ChrgBr>SLEV</ChrgBr>
+      <CdtTrfTxInf>
+        <PmtId>
+          <EndToEndId>""" & messageId & """</EndToEndId>
+        </PmtId>
+        <Amt>
+          <InstdAmt Ccy=\"""" & transfer.currency & """">""" & amountStr & """</InstdAmt>
+        </Amt>
+        <CdtrAgt>
+          <FinInstnId>
+            <BICFI>""" & transfer.recipientBic & """</BICFI>
+          </FinInstnId>
+        </CdtrAgt>
+        <Cdtr>
+          <Nm>""" & escapeXml(transfer.recipientName) & """</Nm>
+        </Cdtr>
+        <CdtrAcct>
+          <Id>
+            <IBAN>""" & transfer.recipientIban & """</IBAN>
+          </Id>
+        </CdtrAcct>
+        <RmtInf>
+          <Ustrd>""" & escapeXml(transfer.reference) & """</Ustrd>
+        </RmtInf>
+      </CdtTrfTxInf>
+    </PmtInf>
+  </CstmrCdtTrfInitn>
+</Document>"""
+
+proc buildHKIPZ(segNum: int, account: Account, transfer: TransferRequest): string =
+  ## Build HKIPZ segment (Einzelne SEPA-Instant-Überweisung)
+  let messageId = generateReference()
+  let pain = generatePain001(transfer, account, messageId)
+
+  # KTI1 (International account connection)
+  let kti = account.iban & ":" & account.bic & ":" & account.number & "::" & account.blz
+
+  let data = @[
+    kti,
+    "urn?:iso?:std?:iso?:20022?:tech?:xsd?:pain.001.001.09",  # SEPA descriptor
+    "@" & $pain.len & "@" & pain  # Binary data with length prefix
+  ]
+  result = buildSegment("HKIPZ", 1, segNum, data)
+
+proc buildHKCCS(segNum: int, account: Account, transfer: TransferRequest): string =
+  ## Build HKCCS segment (Einzelne SEPA-Überweisung) - standard non-instant
+  let messageId = generateReference()
+  let pain = generatePain001(transfer, account, messageId)
+
+  let kti = account.iban & ":" & account.bic & ":" & account.number & "::" & account.blz
+
+  let data = @[
+    kti,
+    "urn?:iso?:std?:iso?:20022?:tech?:xsd?:pain.001.001.09",
+    "@" & $pain.len & "@" & pain
+  ]
+  result = buildSegment("HKCCS", 1, segNum, data)
+
+# --- Segment parsing ---
+
+proc parseSegments(msg: string): seq[tuple[name: string, version, num: int, data: seq[string]]] =
+  ## Parse FinTS message into segments
+  result = @[]
+  var pos = 0
+  var segmentStart = 0
+  var inBinary = false
+  var binaryLen = 0
+  var binaryCount = 0
+
+  while pos < msg.len:
+    if inBinary:
+      binaryCount += 1
+      if binaryCount >= binaryLen:
+        inBinary = false
+      pos += 1
+      continue
+
+    # Check for binary data marker @123@
+    if msg[pos] == '@' and not inBinary:
+      var numEnd = pos + 1
+      while numEnd < msg.len and msg[numEnd] in '0'..'9':
+        numEnd += 1
+      if numEnd > pos + 1 and numEnd < msg.len and msg[numEnd] == '@':
+        binaryLen = parseInt(msg[pos+1 ..< numEnd])
+        pos = numEnd + 1
+        inBinary = true
+        binaryCount = 0
+        continue
+
+    # Check for segment end (unescaped ')
+    if msg[pos] == '\'' and (pos == 0 or msg[pos-1] != '?'):
+      let segment = msg[segmentStart .. pos - 1]
+      if segment.len > 0:
+        # Parse segment header
+        let colonPos = segment.find(':')
+        if colonPos > 0:
+          let name = segment[0 ..< colonPos]
+          # Find version and segment number
+          var rest = segment[colonPos + 1 .. ^1]
+          let colonPos2 = rest.find(':')
+          if colonPos2 > 0:
+            let num = try: parseInt(rest[0 ..< colonPos2]) except: 0
+            rest = rest[colonPos2 + 1 .. ^1]
+            let plusPos = rest.find('+')
+            var version: int
+            var dataStr: string
+            if plusPos > 0:
+              version = try: parseInt(rest[0 ..< plusPos]) except: 0
+              dataStr = rest[plusPos + 1 .. ^1]
+            else:
+              version = try: parseInt(rest) except: 0
+              dataStr = ""
+
+            # Split data by + (respecting escapes)
+            var data: seq[string] = @[]
+            if dataStr.len > 0:
+              var current = ""
+              var i = 0
+              while i < dataStr.len:
+                if dataStr[i] == '?' and i + 1 < dataStr.len:
+                  current.add(dataStr[i + 1])
+                  i += 2
+                elif dataStr[i] == '+':
+                  data.add(current)
+                  current = ""
+                  i += 1
+                else:
+                  current.add(dataStr[i])
+                  i += 1
+              data.add(current)
+
+            result.add((name: name, version: version, num: num, data: data))
+
+      segmentStart = pos + 1
+
+    pos += 1
+
+proc findSegment(segments: seq[tuple[name: string, version, num: int, data: seq[string]]], name: string): int =
+  ## Find segment index by name, returns -1 if not found
+  for i, seg in segments:
+    if seg.name == name:
+      return i
+  return -1
+
+proc extractHNVSDContent(msg: string): string =
+  ## Extract the inner content from HNVSD segment directly from raw message
+  ## HNVSD format: HNVSD:999:1+@length@<content>'
+  let hnvsdPos = msg.find("HNVSD:999:1+@")
+  if hnvsdPos < 0:
+    return ""
+
+  # Find the length prefix
+  var lenStart = hnvsdPos + 13  # after "HNVSD:999:1+@"
+  var lenEnd = lenStart
+  while lenEnd < msg.len and msg[lenEnd] in '0'..'9':
+    lenEnd += 1
+
+  if lenEnd >= msg.len or msg[lenEnd] != '@':
+    return ""
+
+  let contentLen = try: parseInt(msg[lenStart ..< lenEnd]) except: return ""
+  let contentStart = lenEnd + 1
+
+  if contentStart + contentLen > msg.len:
+    return ""
+
+  return msg[contentStart ..< contentStart + contentLen]
+
+proc parseAllSegments(msg: string): seq[tuple[name: string, version, num: int, data: seq[string]]] =
+  ## Parse FinTS message including inner HNVSD content
+  let outerSegments = parseSegments(msg)
+  let innerContent = extractHNVSDContent(msg)
+  if innerContent.len > 0:
+    # Parse inner segments and combine with outer
+    let innerSegments = parseSegments(innerContent)
+    result = outerSegments & innerSegments
+  else:
+    result = outerSegments
+
+# --- Client implementation ---
+
+proc newFintsClient*(url, blz, user, pin: string, productVersion: string = "0.1.0"): FintsClient =
+  ## Create a new FinTS client
+  result = FintsClient(
+    url: url,
+    blz: blz,
+    user: user,
+    pin: pin,
+    productId: ProductId,
+    productVersion: productVersion,
+    dialogId: "0",
+    msgNum: 0,
+    systemId: "0",
+    http: newHttpClient(sslContext = newContext(verifyMode = CVerifyPeer))
+  )
+  result.http.headers = newHttpHeaders({"Content-Type": "text/plain"})
+
+proc close*(client: var FintsClient) =
+  ## Close the HTTP client
+  client.http.close()
+
+proc sendMessage(client: var FintsClient, segments: string): string =
+  ## Send FinTS message and return response
+  ## segments should contain HNSHK...HNSHA (signed content)
+  client.msgNum += 1
+
+  # Build encryption wrapper
+  let hnvsk = buildHNVSK(client.blz, client.user, client.systemId)
+  let hnvsd = buildHNVSD(segments)
+
+  # Calculate message length
+  # Structure: HNHBK + HNVSK + HNVSD + HNHBS
+  let innerContent = hnvsk & hnvsd
+  var msg = buildHNHBK(0, client.dialogId, client.msgNum)
+  let headerLen = msg.len
+  let hnhbs = buildHNHBS(client.msgNum, 4)  # 4 segments: HNHBK, HNVSK, HNVSD, HNHBS
+
+  # Calculate total length and rebuild
+  let totalLen = headerLen + innerContent.len + hnhbs.len
+  msg = buildHNHBK(totalLen, client.dialogId, client.msgNum) & innerContent & hnhbs
+
+  # Encode and send
+  let encoded = encode(msg)
+
+  if client.debug:
+    stderr.writeLine "[DEBUG] Sending to: " & client.url
+    stderr.writeLine "[DEBUG] Request: " & msg[0 .. min(500, msg.len - 1)] & "..."
+
+  try:
+    let response = client.http.postContent(client.url, body = encoded)
+    result = decode(response)
+    if client.debug:
+      stderr.writeLine "[DEBUG] Response: " & result[0 .. min(1000, result.len - 1)] & "..."
+  except:
+    raise newException(FintsError, "HTTP request failed: " & getCurrentExceptionMsg())
+
+proc parseResponse(de: string): tuple[code: string, refSeg: string, msg: string] =
+  ## Parse HIRMG/HIRMS data element: "code:refSeg:message" or "code::message"
+  let parts = de.split(':', maxsplit = 2)
+  if parts.len >= 1:
+    result.code = parts[0]
+  if parts.len >= 2:
+    result.refSeg = parts[1]
+  if parts.len >= 3:
+    result.msg = parts[2]
+
+proc initDialog*(client: var FintsClient): bool =
+  ## Initialize FinTS dialog (anonymous dialog for BPD/UPD)
+  ## Raises FintsError on failure with detailed error message
+  client.dialogId = "0"
+  client.msgNum = 0
+
+  if client.debug:
+    stderr.writeLine "[DEBUG] PIN length: " & $client.pin.len & ", escaped: " & $escapeFintsData(client.pin).len
+
+  # Build init segments
+  var segments = ""
+  var segNum = 2
+
+  # Security header
+  segments.add buildHNSHK(segNum, "999", "1", client.blz, client.user, client.systemId)
+  segNum += 1
+
+  # Identification
+  segments.add buildHKIDN(segNum, client.blz, client.user, client.systemId)
+  segNum += 1
+
+  # Processing preparation
+  segments.add buildHKVVB(segNum, 0, 0)
+  segNum += 1
+
+  # TAN process (start two-step TAN for dialog init)
+  segments.add buildHKTAN(segNum, "4", "HKIDN")
+  segNum += 1
+
+  # Security footer
+  segments.add buildHNSHA(segNum, 1, client.pin)
+  segNum += 1
+
+  let response = client.sendMessage(segments)
+  let respSegments = parseAllSegments(response)
+
+  if client.debug:
+    stderr.writeLine "[DEBUG] Parsed " & $respSegments.len & " segments"
+    for seg in respSegments:
+      stderr.writeLine "[DEBUG]   - " & seg.name & ":" & $seg.num & ":" & $seg.version & " (" & $seg.data.len & " data elements)"
+
+  # Check for HIRMG/HIRMS for errors FIRST (before extracting dialog ID)
+  var errors: seq[string] = @[]
+  for seg in respSegments:
+    if seg.name == "HIRMG" or seg.name == "HIRMS":
+      for de in seg.data:
+        let parsed = parseResponse(de)
+        if client.debug:
+          stderr.writeLine "[DEBUG] " & seg.name & " response: code=" & parsed.code & " msg=" & parsed.msg
+        if parsed.code.len >= 4 and parsed.code[0] == '9':  # Error codes start with 9
+          errors.add(parsed.code & ": " & parsed.msg)
+
+  if errors.len > 0:
+    raise newException(FintsError, "Dialog initialization failed: " & errors.join("; "))
+
+  # Check for HNHBK to get dialog ID
+  let hnhbkIdx = findSegment(respSegments, "HNHBK")
+  if hnhbkIdx >= 0 and respSegments[hnhbkIdx].data.len >= 3:
+    client.dialogId = respSegments[hnhbkIdx].data[2]
+    if client.debug:
+      stderr.writeLine "[DEBUG] Dialog ID: " & client.dialogId
+
+  # Parse BPD for supported segments
+  for seg in respSegments:
+    if seg.name == "HIPINS":  # PIN/TAN info
+      # Parse supported TAN methods
+      discard
+    elif seg.name == "HIIPZS":  # SEPA instant payment info
+      client.bankParams.supportsInstantPayment = true
+
+  return true
+
+proc endDialog*(client: var FintsClient) =
+  ## End FinTS dialog
+  if client.dialogId != "0":
+    var segments = ""
+    var segNum = 2
+
+    segments.add buildHNSHK(segNum, "999", "1", client.blz, client.user, client.systemId)
+    segNum += 1
+
+    segments.add buildHKEND(segNum, client.dialogId)
+    segNum += 1
+
+    segments.add buildHNSHA(segNum, 1, client.pin)
+
+    discard client.sendMessage(segments)
+    client.dialogId = "0"
+
+proc transfer*(client: var FintsClient, request: TransferRequest): TransferResult =
+  ## Execute SEPA transfer (instant or standard)
+  result = TransferResult(success: false)
+
+  # Ensure dialog is initialized
+  if client.dialogId == "0":
+    try:
+      discard client.initDialog()
+    except FintsError as e:
+      result.errorMsg = e.msg
+      return
+
+  var segments = ""
+  var segNum = 2
+
+  # Security header
+  segments.add buildHNSHK(segNum, "999", "1", client.blz, client.user, client.systemId)
+  segNum += 1
+
+  # Transfer segment
+  var transferSegType: string
+  if request.instant:
+    segments.add buildHKIPZ(segNum, client.account, request)
+    transferSegType = "HKIPZ"
+  else:
+    segments.add buildHKCCS(segNum, client.account, request)
+    transferSegType = "HKCCS"
+  segNum += 1
+
+  # TAN process
+  segments.add buildHKTAN(segNum, "4", transferSegType)
+  segNum += 1
+
+  # Security footer
+  segments.add buildHNSHA(segNum, 1, client.pin)
+
+  let response = client.sendMessage(segments)
+  let respSegments = parseAllSegments(response)
+
+  # Check response
+  for seg in respSegments:
+    if seg.name == "HIRMG" or seg.name == "HIRMS":
+      for de in respSegments[findSegment(respSegments, seg.name)].data:
+        if de.startsWith("0010") or de.startsWith("0020"):
+          result.success = true
+        elif de.startsWith("0030"):  # TAN required
+          result.tanRequired = true
+        elif de.startsWith("9"):
+          result.success = false
+          result.errorCode = de[0..3]
+          if de.len > 5:
+            result.errorMsg = de[5..^1]
+    elif seg.name == "HITAN":
+      if seg.data.len > 3:
+        result.orderRef = seg.data[3]
+      if seg.data.len > 4:
+        result.tanChallenge = unescapeFintsData(seg.data[4])
+
+  return result
+
+proc submitTan*(client: var FintsClient, orderRef: string, tan: string): TransferResult =
+  ## Submit TAN for pending transfer
+  result = TransferResult(success: false)
+
+  var segments = ""
+  var segNum = 2
+
+  segments.add buildHNSHK(segNum, "999", "1", client.blz, client.user, client.systemId)
+  segNum += 1
+
+  segments.add buildHKTAN(segNum, "2", "", orderRef)
+  segNum += 1
+
+  segments.add buildHNSHA(segNum, 1, client.pin, tan)
+
+  let response = client.sendMessage(segments)
+  let respSegments = parseAllSegments(response)
+
+  for seg in respSegments:
+    if seg.name == "HIRMG" or seg.name == "HIRMS":
+      for de in respSegments[findSegment(respSegments, seg.name)].data:
+        if de.startsWith("0010") or de.startsWith("0020"):
+          result.success = true
+        elif de.startsWith("9"):
+          result.errorCode = de[0..3]
+          if de.len > 5:
+            result.errorMsg = de[5..^1]
+
+  return result
+
+# --- Convenience functions ---
+
+proc makeTransfer*(url, blz, user, pin: string,
+                   senderIban, senderBic, senderName: string,
+                   recipientIban, recipientBic, recipientName: string,
+                   amount: float, reference: string,
+                   instant: bool = true,
+                   debug: bool = false): TransferResult =
+  ## Convenience function for one-shot transfer
+  var client = newFintsClient(url, blz, user, pin)
+  client.debug = debug
+  defer: client.close()
+
+  client.account = Account(
+    iban: senderIban,
+    bic: senderBic,
+    holder: senderName,
+    blz: blz
+  )
+
+  let request = TransferRequest(
+    recipientName: recipientName,
+    recipientIban: recipientIban,
+    recipientBic: recipientBic,
+    amount: amount,
+    currency: "EUR",
+    reference: reference,
+    instant: instant
+  )
+
+  result = client.transfer(request)
+  client.endDialog()
