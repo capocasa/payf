@@ -10,8 +10,5 @@ nimcache/
 .vscode/
 .idea/
 *.swp
-# Dev notes
-STATUS.md
-
 # Test binaries
 tests/test_fints
