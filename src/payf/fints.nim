@@ -3,7 +3,7 @@
 ## Implements the minimal subset needed for HKIPZ (Einzelne SEPA-Instant-Überweisung)
 ## Reference: FinTS 3.0 specification and python-fints
 
-import std/[httpclient, base64, strutils, strformat, times]
+import std/[httpclient, base64, strutils, strformat, times, random, os]
 import std/net
 
 const
@@ -47,6 +47,9 @@ type
     systemId*: string
     bankParams*: BankParams
     selectedTanMethod*: string
+    hktanVersion*: int  # HKTAN segment version (6 or 7)
+    vopReportFormat*: string  # VoP report format from HIVPPS
+    vopRequired*: bool  # Whether VoP is required for transfers
     debug*: bool
     http: HttpClient
 
@@ -109,6 +112,16 @@ proc unescapeFintsData*(s: string): string =
     else:
       result.add(s[i])
       i += 1
+
+proc extractBinary*(s: string): string =
+  ## Extract binary content from @len@data format
+  if s.len > 2 and s[0] == '@':
+    var lenEnd = 1
+    while lenEnd < s.len and s[lenEnd] in '0'..'9':
+      lenEnd += 1
+    if lenEnd < s.len and s[lenEnd] == '@':
+      return s[lenEnd + 1 .. ^1]
+  return s
 
 proc formatAmount*(amount: float): string =
   ## Format amount with comma decimal separator (German format)
@@ -181,6 +194,9 @@ proc buildHNSHK(segNum: int, secFunc, secRef: string, blz, user, systemId: strin
   ## Security header (Sicherheitskopf) for PIN/TAN
   ## Format based on FinTS 3.0 spec and working implementations
   let escapedUser = escapeFintsData(user)
+  let now = now()
+  let dateStr = now.format("yyyyMMdd")
+  let timeStr = now.format("HHmmss")
   let secData = @[
     "PIN:1",                       # Security profile (PIN version 1)
     secFunc,                       # Security function (999=single step)
@@ -188,8 +204,8 @@ proc buildHNSHK(segNum: int, secFunc, secRef: string, blz, user, systemId: strin
     "1",                           # Security area (1=SHM)
     "1",                           # Security role (1=ISS)
     "2::" & systemId,              # Security identification (2=system ID based)
-    "0",                           # Security reference number
-    "1",                           # Security datetime (1=STS)
+    "1",                           # Security reference number
+    "1:" & dateStr & ":" & timeStr, # Security datetime (1=STS, date, time)
     "1:999:1",                     # Hash algorithm
     "6:10:16",                     # Signature algorithm
     "280:" & blz & ":" & escapedUser & ":S:0:0"  # Key name (280=Germany)
@@ -231,8 +247,8 @@ proc buildHKVVB(segNum: int, bpdVersion, updVersion: int, lang: int = 0, product
   ]
   result = buildSegment("HKVVB", 3, segNum, data)
 
-proc buildHKTAN(segNum: int, tanProcess: string, segmentType: string = "", orderRef: string = "", tanMediaName: string = ""): string =
-  ## TAN process segment (HKTAN version 6)
+proc buildHKTAN(segNum: int, tanProcess: string, segmentType: string = "", orderRef: string = "", tanMediaName: string = "", version: int = 7): string =
+  ## TAN process segment
   ## tanProcess: "4" = start, "2" = submit TAN, "S" = check decoupled status
   ## segmentType: for process 4, the segment type needing TAN (e.g., "HKIDN")
   var data: seq[string]
@@ -240,12 +256,29 @@ proc buildHKTAN(segNum: int, tanProcess: string, segmentType: string = "", order
   of "4":  # Start TAN process
     data = @[tanProcess, segmentType, "", "", "", "", "", "", "", "", tanMediaName]
   of "2":  # Submit TAN
-    data = @[tanProcess, "", "", "", orderRef]
+    data = @[tanProcess, "", "", "", escapeFintsData(orderRef)]
   of "S":  # Check decoupled status
-    data = @[tanProcess, "", "", "", orderRef]
+    data = @[tanProcess, "", "", "", escapeFintsData(orderRef)]
   else:
     data = @[tanProcess]
-  result = buildSegment("HKTAN", 6, segNum, data)
+  result = buildSegment("HKTAN", version, segNum, data)
+
+proc buildHKVPP(segNum: int, reportFormat: string, pollingId: string = "", offset: string = ""): string =
+  ## VoP name check request (Namensabgleich Prüfauftrag)
+  ## HKVPP1 fields: supported_reports, polling_id, max_queries, offset
+  if pollingId.len > 0 or offset.len > 0:
+    let pidField = if pollingId.len > 0: "@" & $pollingId.len & "@" & pollingId else: ""
+    let offField = if offset.len > 0: escapeFintsData(offset) else: ""
+    let data = @[escapeFintsData(reportFormat), pidField, "", offField]
+    result = buildSegment("HKVPP", 1, segNum, data)
+  else:
+    let data = @[escapeFintsData(reportFormat)]
+    result = buildSegment("HKVPP", 1, segNum, data)
+
+proc buildHKVPA(segNum: int, vopId: string): string =
+  ## VoP approval (Namensabgleich Ausführungsauftrag)
+  let data = @["@" & $vopId.len & "@" & vopId]
+  result = buildSegment("HKVPA", 1, segNum, data)
 
 proc buildHKEND(segNum: int, dialogId: string): string =
   ## Dialog end segment
@@ -254,12 +287,20 @@ proc buildHKEND(segNum: int, dialogId: string): string =
 
 # --- SEPA XML generation ---
 
+proc formatAmountXml*(amount: float): string =
+  ## Format amount with dot decimal separator for pain.001 XML
+  let parts = ($amount).split('.')
+  if parts.len == 2:
+    result = parts[0] & "." & parts[1].alignLeft(2, '0')[0..1]
+  else:
+    result = parts[0] & ".00"
+
 proc generatePain001*(transfer: TransferRequest, debtor: Account, messageId: string): string =
   ## Generate pain.001.001.09 XML for SEPA instant transfer
-  let amountStr = formatAmount(transfer.amount)
+  let amountStr = formatAmountXml(transfer.amount)
   let now = now()
   let creationDate = now.format("yyyy-MM-dd'T'HH:mm:ss")
-  let requestedDate = now.format("yyyy-MM-dd")
+  let requestedDate = if transfer.instant: "1999-01-01" else: now.format("yyyy-MM-dd")
 
   result = """<?xml version="1.0" encoding="UTF-8"?>
 <Document xmlns="urn:iso:std:iso:20022:tech:xsd:pain.001.001.09" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
@@ -315,13 +356,18 @@ proc generatePain001*(transfer: TransferRequest, debtor: Account, messageId: str
           <EndToEndId>""" & messageId & """</EndToEndId>
         </PmtId>
         <Amt>
-          <InstdAmt Ccy=\"""" & transfer.currency & """">""" & amountStr & """</InstdAmt>
-        </Amt>
+          <InstdAmt Ccy='""" & transfer.currency & """'>""" & amountStr & """</InstdAmt>
+        </Amt>"""
+
+  if transfer.recipientBic.len > 0:
+    result.add """
         <CdtrAgt>
           <FinInstnId>
             <BICFI>""" & transfer.recipientBic & """</BICFI>
           </FinInstnId>
-        </CdtrAgt>
+        </CdtrAgt>"""
+
+  result.add """
         <Cdtr>
           <Nm>""" & escapeXml(transfer.recipientName) & """</Nm>
         </Cdtr>
@@ -338,27 +384,30 @@ proc generatePain001*(transfer: TransferRequest, debtor: Account, messageId: str
   </CstmrCdtTrfInitn>
 </Document>"""
 
-proc buildHKIPZ(segNum: int, account: Account, transfer: TransferRequest): string =
+proc buildHKIPZFromPain(segNum: int, account: Account, pain: string): string =
+  ## Build HKIPZ segment from pre-generated pain.001 XML
+  let kti = account.iban & ":" & account.bic
+  let data = @[
+    kti,
+    "urn?:iso?:std?:iso?:20022?:tech?:xsd?:pain.001.001.09",
+    "@" & $pain.len & "@" & pain
+  ]
+  result = buildSegment("HKIPZ", 1, segNum, data)
+
+proc buildHKIPZ(segNum: int, account: Account, transfer: TransferRequest, debug: bool = false): string =
   ## Build HKIPZ segment (Einzelne SEPA-Instant-Überweisung)
   let messageId = generateReference()
   let pain = generatePain001(transfer, account, messageId)
-
-  # KTI1 (International account connection)
-  let kti = account.iban & ":" & account.bic & ":" & account.number & "::" & account.blz
-
-  let data = @[
-    kti,
-    "urn?:iso?:std?:iso?:20022?:tech?:xsd?:pain.001.001.09",  # SEPA descriptor
-    "@" & $pain.len & "@" & pain  # Binary data with length prefix
-  ]
-  result = buildSegment("HKIPZ", 1, segNum, data)
+  if debug:
+    stderr.writeLine "[DEBUG] pain.001 XML:\n" & pain
+  result = buildHKIPZFromPain(segNum, account, pain)
 
 proc buildHKCCS(segNum: int, account: Account, transfer: TransferRequest): string =
   ## Build HKCCS segment (Einzelne SEPA-Überweisung) - standard non-instant
   let messageId = generateReference()
   let pain = generatePain001(transfer, account, messageId)
 
-  let kti = account.iban & ":" & account.bic & ":" & account.number & "::" & account.blz
+  let kti = account.iban & ":" & account.bic
 
   let data = @[
     kti,
@@ -402,20 +451,31 @@ proc parseSegments(msg: string): seq[tuple[name: string, version, num: int, data
     if msg[pos] == '\'' and (pos == 0 or msg[pos-1] != '?'):
       let segment = msg[segmentStart .. pos - 1]
       if segment.len > 0:
-        # Parse segment header
+        # Parse segment header: NAME:num:version+data or NAME:num:version:ref+data
         let colonPos = segment.find(':')
         if colonPos > 0:
           let name = segment[0 ..< colonPos]
-          # Find version and segment number
+          # Find segment number, version, and optional ref
           var rest = segment[colonPos + 1 .. ^1]
           let colonPos2 = rest.find(':')
           if colonPos2 > 0:
             let num = try: parseInt(rest[0 ..< colonPos2]) except: 0
             rest = rest[colonPos2 + 1 .. ^1]
+            # Version might be followed by :ref or +data
             let plusPos = rest.find('+')
+            let colonPos3 = rest.find(':')
             var version: int
             var dataStr: string
-            if plusPos > 0:
+            if colonPos3 > 0 and (plusPos < 0 or colonPos3 < plusPos):
+              # Format: version:ref+data or version:ref
+              version = try: parseInt(rest[0 ..< colonPos3]) except: 0
+              let afterRef = rest[colonPos3 + 1 .. ^1]
+              let plusPos2 = afterRef.find('+')
+              if plusPos2 > 0:
+                dataStr = afterRef[plusPos2 + 1 .. ^1]
+              else:
+                dataStr = ""
+            elif plusPos > 0:
               version = try: parseInt(rest[0 ..< plusPos]) except: 0
               dataStr = rest[plusPos + 1 .. ^1]
             else:
@@ -510,9 +570,16 @@ proc close*(client: var FintsClient) =
   ## Close the HTTP client
   client.http.close()
 
-proc sendMessage(client: var FintsClient, segments: string): string =
+proc reconnect*(client: var FintsClient) =
+  ## Recreate HTTP client (needed after bank closes connection)
+  client.http.close()
+  client.http = newHttpClient(sslContext = newContext(verifyMode = CVerifyPeer))
+  client.http.headers = newHttpHeaders({"Content-Type": "text/plain"})
+
+proc sendMessage(client: var FintsClient, segments: string, lastSegNum: int): string =
   ## Send FinTS message and return response
   ## segments should contain HNSHK...HNSHA (signed content)
+  ## lastSegNum is the segment number of the last inner segment
   client.msgNum += 1
 
   # Build encryption wrapper
@@ -524,7 +591,7 @@ proc sendMessage(client: var FintsClient, segments: string): string =
   let innerContent = hnvsk & hnvsd
   var msg = buildHNHBK(0, client.dialogId, client.msgNum)
   let headerLen = msg.len
-  let hnhbs = buildHNHBS(client.msgNum, 4)  # 4 segments: HNHBK, HNVSK, HNVSD, HNHBS
+  let hnhbs = buildHNHBS(client.msgNum, lastSegNum + 1)
 
   # Calculate total length and rebuild
   let totalLen = headerLen + innerContent.len + hnhbs.len
@@ -539,9 +606,18 @@ proc sendMessage(client: var FintsClient, segments: string): string =
 
   try:
     let response = client.http.postContent(client.url, body = encoded)
-    result = decode(response)
+    try:
+      # Strip whitespace/newlines — some banks return MIME-style base64
+      let cleaned = response.replace("\r", "").replace("\n", "").strip()
+      result = decode(cleaned)
+    except:
+      if client.debug:
+        stderr.writeLine "[DEBUG] Raw response (not base64): " & response[0 .. min(500, response.len - 1)]
+      raise newException(FintsError, "Invalid base64 response from bank")
     if client.debug:
       stderr.writeLine "[DEBUG] Response: " & result[0 .. min(1000, result.len - 1)] & "..."
+  except FintsError:
+    raise
   except:
     raise newException(FintsError, "HTTP request failed: " & getCurrentExceptionMsg())
 
@@ -567,9 +643,11 @@ proc initDialog*(client: var FintsClient): bool =
   # Build init segments
   var segments = ""
   var segNum = 2
+  let secRef = $rand(1000000..9999999)
+  let secFunc = if client.selectedTanMethod.len > 0: client.selectedTanMethod else: "999"
 
   # Security header
-  segments.add buildHNSHK(segNum, "999", "1", client.blz, client.user, client.systemId)
+  segments.add buildHNSHK(segNum, secFunc, secRef, client.blz, client.user, client.systemId)
   segNum += 1
 
   # Identification
@@ -580,15 +658,15 @@ proc initDialog*(client: var FintsClient): bool =
   segments.add buildHKVVB(segNum, 0, 0)
   segNum += 1
 
-  # TAN process (start two-step TAN for dialog init)
-  segments.add buildHKTAN(segNum, "4", "HKIDN")
-  segNum += 1
+  # TAN process (only for two-step auth when TAN method is known)
+  if client.selectedTanMethod.len > 0:
+    segments.add buildHKTAN(segNum, "4", "HKIDN", version = client.hktanVersion)
+    segNum += 1
 
   # Security footer
-  segments.add buildHNSHA(segNum, 1, client.pin)
-  segNum += 1
+  segments.add buildHNSHA(segNum, secRef.parseInt, client.pin)
 
-  let response = client.sendMessage(segments)
+  let response = client.sendMessage(segments, segNum)
   let respSegments = parseAllSegments(response)
 
   if client.debug:
@@ -610,6 +688,19 @@ proc initDialog*(client: var FintsClient): bool =
   if errors.len > 0:
     raise newException(FintsError, "Dialog initialization failed: " & errors.join("; "))
 
+  # Parse TAN method from HIRMS 3920 response
+  for seg in respSegments:
+    if seg.name == "HIRMS":
+      for de in seg.data:
+        let parsed = parseResponse(de)
+        if parsed.code == "3920":
+          # Format: "Zugelassene TAN-Verfahren für den Benutzer:methodId"
+          let parts = parsed.msg.split(':')
+          if parts.len >= 2:
+            client.selectedTanMethod = parts[^1].strip()
+            if client.debug:
+              stderr.writeLine "[DEBUG] Selected TAN method: " & client.selectedTanMethod
+
   # Check for HNHBK to get dialog ID
   let hnhbkIdx = findSegment(respSegments, "HNHBK")
   if hnhbkIdx >= 0 and respSegments[hnhbkIdx].data.len >= 3:
@@ -620,10 +711,48 @@ proc initDialog*(client: var FintsClient): bool =
   # Parse BPD for supported segments
   for seg in respSegments:
     if seg.name == "HIPINS":  # PIN/TAN info
-      # Parse supported TAN methods
       discard
     elif seg.name == "HIIPZS":  # SEPA instant payment info
       client.bankParams.supportsInstantPayment = true
+      if client.debug:
+        stderr.writeLine "[DEBUG] HIIPZS data: " & $seg.data
+    elif seg.name == "HISPAS":
+      if client.debug:
+        stderr.writeLine "[DEBUG] HISPAS data: " & $seg.data
+    elif seg.name == "HICCSS":
+      if client.debug:
+        stderr.writeLine "[DEBUG] HICCSS data: " & $seg.data
+    elif seg.name == "HIVPPS":
+      if client.debug:
+        stderr.writeLine "[DEBUG] HIVPPS data: " & $seg.data
+      # Parse VoP parameters - check if HKIPZ/HKCCS requires VoP
+      if seg.data.len > 3:
+        let paramData = seg.data[3]
+        if "HKIPZ" in paramData or "HKCCS" in paramData:
+          client.vopRequired = true
+          # Extract the full URN for pain.002 report format
+          # Format in DEG: "999:J:V:J:J:urn:iso:std:iso:20022:tech:xsd:pain.002.001.10:HKCCS:..."
+          # The URN starts with "urn" and ends before the first HK segment code
+          let urnStart = paramData.find("urn")
+          if urnStart >= 0:
+            let afterUrn = paramData[urnStart .. ^1]
+            # Find end of URN - it ends before :HK or at end of string
+            let hkPos = afterUrn.find(":HK")
+            if hkPos > 0:
+              client.vopReportFormat = afterUrn[0 ..< hkPos]
+            else:
+              client.vopReportFormat = afterUrn
+          if client.debug:
+            stderr.writeLine "[DEBUG] VoP required, report format: " & client.vopReportFormat
+    elif seg.name == "HITANS":
+      if client.debug:
+        stderr.writeLine "[DEBUG] HITANS version " & $seg.version & " data: " & $seg.data
+      # Check if this HITANS version contains the selected TAN method
+      if client.selectedTanMethod.len > 0 and seg.data.len > 3:
+        if client.selectedTanMethod in seg.data[3]:
+          client.hktanVersion = seg.version
+          if client.debug:
+            stderr.writeLine "[DEBUG] Using HKTAN version " & $seg.version & " for TAN method " & client.selectedTanMethod
 
   return true
 
@@ -632,75 +761,323 @@ proc endDialog*(client: var FintsClient) =
   if client.dialogId != "0":
     var segments = ""
     var segNum = 2
+    let secRef = $rand(1000000..9999999)
 
-    segments.add buildHNSHK(segNum, "999", "1", client.blz, client.user, client.systemId)
+    segments.add buildHNSHK(segNum, "999", secRef, client.blz, client.user, client.systemId)
     segNum += 1
 
     segments.add buildHKEND(segNum, client.dialogId)
     segNum += 1
 
-    segments.add buildHNSHA(segNum, 1, client.pin)
+    segments.add buildHNSHA(segNum, secRef.parseInt, client.pin)
 
-    discard client.sendMessage(segments)
+    try:
+      discard client.sendMessage(segments, segNum)
+    except FintsError:
+      discard  # Dialog may already be closed by bank
     client.dialogId = "0"
+
+proc parseHIVPP(seg: tuple[name: string, version, num: int, data: seq[string]], debug: bool): tuple[vopId, pollingId, resultCode, differentName: string, waitSec: int] =
+  ## Parse HIVPP response fields
+  ## Fields: vopid(0), vopidvalidto(1), pollingid(2), reportdesc(3), report(4), result_DEG(5), infotext(6), wait(7)
+  result.waitSec = 2
+  if debug:
+    stderr.writeLine "[DEBUG] HIVPP: " & $seg.data
+  # Field 0: vopId (binary @len@data)
+  if seg.data.len > 0 and seg.data[0].len > 0:
+    let raw = seg.data[0]
+    if raw.startsWith("@"):
+      result.vopId = extractBinary(raw)
+    else:
+      result.vopId = raw
+  # Field 2: pollingId (binary @len@data)
+  if seg.data.len > 2 and seg.data[2].len > 0:
+    let raw = seg.data[2]
+    if raw.startsWith("@"):
+      result.pollingId = extractBinary(raw)
+    else:
+      result.pollingId = raw
+  # Field 5: result DEG (iban:ibanaddon:differentname:otheridentifier:result_code:reason)
+  if seg.data.len > 5 and seg.data[5].len > 0:
+    let parts = seg.data[5].split(':')
+    if parts.len >= 5:
+      result.resultCode = parts[4]
+    if parts.len >= 3 and parts[2].len > 0:
+      result.differentName = parts[2]
+  # Field 7: wait seconds
+  if seg.data.len > 7 and seg.data[7].len > 0:
+    try:
+      result.waitSec = parseInt(seg.data[7])
+    except: discard
 
 proc transfer*(client: var FintsClient, request: TransferRequest): TransferResult =
   ## Execute SEPA transfer (instant or standard)
+  ## Implements the correct VoP flow: Check → Poll → Auth
   result = TransferResult(success: false)
 
-  # Ensure dialog is initialized
+  # Ensure dialog is initialized with proper TAN method
   if client.dialogId == "0":
     try:
+      # First dialog: discover TAN methods and BPD (one-step auth)
       discard client.initDialog()
+      # If we discovered a TAN method, re-init with proper two-step auth
+      if client.selectedTanMethod.len > 0 and client.selectedTanMethod != "999":
+        client.endDialog()
+        discard client.initDialog()
     except FintsError as e:
       result.errorMsg = e.msg
       return
 
-  var segments = ""
-  var segNum = 2
+  let secFunc = if client.selectedTanMethod.len > 0: client.selectedTanMethod else: "999"
+  let hktanVer = if client.hktanVersion > 0: client.hktanVersion else: 7
 
-  # Security header
-  segments.add buildHNSHK(segNum, "999", "1", client.blz, client.user, client.systemId)
-  segNum += 1
+  # Step 1: Send HKVPP (VoP Check) + HKIPZ (transfer) + HKTAN (process 4)
+  var vopId = ""
+  var vopPollingId = ""
+  var vopWaitSec = 2
+  var vopResultCode = ""
+  var vopDifferentName = ""
+  var vopOffset = ""
+  var vopPending = false
+  var skipVopAuth = false
 
-  # Transfer segment
-  var transferSegType: string
-  if request.instant:
-    segments.add buildHKIPZ(segNum, client.account, request)
-    transferSegType = "HKIPZ"
+  # Generate pain.001 XML once — must be identical in Step 1 and Step 3
+  let transferMessageId = generateReference()
+  let painXml = generatePain001(request, client.account, transferMessageId)
+  if client.debug:
+    stderr.writeLine "[DEBUG] pain.001 XML:\n" & painXml
+
+  block:
+    var segments = ""
+    var segNum = 2
+    let secRef = $rand(1000000..9999999)
+
+    segments.add buildHNSHK(segNum, secFunc, secRef, client.blz, client.user, client.systemId)
+    segNum += 1
+
+    if client.vopRequired and client.vopReportFormat.len > 0:
+      segments.add buildHKVPP(segNum, client.vopReportFormat)
+      segNum += 1
+
+    segments.add buildHKIPZFromPain(segNum, client.account, painXml)
+    segNum += 1
+
+    segments.add buildHKTAN(segNum, "4", "HKIPZ", version = hktanVer)
+    segNum += 1
+
+    segments.add buildHNSHA(segNum, secRef.parseInt, client.pin)
+
+    let response = client.sendMessage(segments, segNum)
+    let respSegments = parseAllSegments(response)
+
+    for seg in respSegments:
+      if seg.name == "HIRMG" or seg.name == "HIRMS":
+        for de in seg.data:
+          let parsed = parseResponse(de)
+          if client.debug:
+            stderr.writeLine "[DEBUG] " & seg.name & ": " & parsed.code & " " & parsed.msg
+          if parsed.code == "0010" or parsed.code == "0020" or parsed.code == "0030":
+            result.success = true
+          elif parsed.code == "3091":
+            # Bank skips VoP auth entirely — proceed directly with TAN
+            skipVopAuth = true
+          elif parsed.code == "3945":
+            # VoP pending — bank hasn't completed name check yet
+            vopPending = true
+          elif parsed.code == "3040":
+            # More data available — extract aufsetzpunkt for polling
+            let msgParts = parsed.msg.split(':')
+            if msgParts.len >= 2 and msgParts[^1].len > 0:
+              vopOffset = msgParts[^1]
+          elif parsed.code.startsWith("9"):
+            result.errorCode = parsed.code
+            result.errorMsg = parsed.msg
+            return
+      elif seg.name == "HITAN":
+        if client.debug:
+          stderr.writeLine "[DEBUG] HITAN data: " & $seg.data
+        # HITAN v7: process(0) + orderHash(1) + orderRef(2) + challenge(3) + ...
+        if seg.data.len > 2:
+          result.orderRef = seg.data[2]
+        if seg.data.len > 3:
+          result.tanChallenge = seg.data[3]
+        if seg.data.len > 6:
+          result.tanMediaName = seg.data[6]
+        result.tanRequired = true
+      elif seg.name == "HIVPP":
+        let hivpp = parseHIVPP(seg, client.debug)
+        vopId = hivpp.vopId
+        vopPollingId = hivpp.pollingId
+        vopWaitSec = hivpp.waitSec
+        vopResultCode = hivpp.resultCode
+        vopDifferentName = hivpp.differentName
+
+    # If bank skips VoP auth (3091) or no VoP required, we're done
+    if skipVopAuth or not client.vopRequired:
+      return result
+
+    # If we got a vopId, skip polling — go straight to Step 3 (VoP Auth)
+    if vopId.len > 0:
+      discard  # Fall through to Step 3 below
+    elif vopPollingId.len > 0:
+      # VoP is pending — try polling, fall back to async if polling fails
+      discard  # Fall through to Step 2 below
+    else:
+      # No vopId and no pollingId — bank may handle VoP asynchronously
+      # (Atruvia banks send SecureGo notification even without HITAN)
+      if result.tanRequired or vopPending:
+        result.tanRequired = true
+        return result
+      result.errorMsg = "VoP: no vopId or pollingId in HIVPP response"
+      return result
+
+  # Step 2: Poll if PENDING (no vopId yet) — use pollingId + offset
+  if vopId.len == 0 and vopPollingId.len > 0:
+    stderr.writeLine "Verifying payee name..."
+    if client.debug:
+      stderr.writeLine "[DEBUG] VoP polling with pollingId=" & vopPollingId & " offset=" & vopOffset & " waitSec=" & $vopWaitSec
+
+    for attempt in 0 ..< 5:
+      sleep(vopWaitSec * 1000)
+      if client.debug:
+        stderr.writeLine "[DEBUG] VoP poll attempt " & $(attempt + 1)
+
+      var segments = ""
+      var segNum = 2
+      let secRef = $rand(1000000..9999999)
+
+      segments.add buildHNSHK(segNum, secFunc, secRef, client.blz, client.user, client.systemId)
+      segNum += 1
+
+      segments.add buildHKVPP(segNum, client.vopReportFormat, vopPollingId, vopOffset)
+      segNum += 1
+
+      segments.add buildHNSHA(segNum, secRef.parseInt, client.pin)
+
+      let response = client.sendMessage(segments, segNum)
+      let respSegments = parseAllSegments(response)
+
+      var gotVopId = false
+      var pollError = false
+      var otherError = ""
+      var otherErrorCode = ""
+      for seg in respSegments:
+        if seg.name == "HIRMG" or seg.name == "HIRMS":
+          for de in seg.data:
+            let parsed = parseResponse(de)
+            if client.debug:
+              stderr.writeLine "[DEBUG] VoP " & seg.name & ": " & parsed.code & " " & parsed.msg
+            if parsed.code == "9210" or parsed.code == "9050":
+              # 9210 = VOP order invalid, 9050 = message contains errors
+              # Both indicate polling not supported — fall back to async
+              pollError = true
+            elif parsed.code == "3040":
+              # Update offset for next poll
+              let msgParts = parsed.msg.split(':')
+              if msgParts.len >= 2 and msgParts[^1].len > 0:
+                vopOffset = msgParts[^1]
+            elif parsed.code.startsWith("9"):
+              otherErrorCode = parsed.code
+              otherError = parsed.msg
+        elif seg.name == "HIVPP":
+          let hivpp = parseHIVPP(seg, client.debug)
+          if hivpp.vopId.len > 0:
+            vopId = hivpp.vopId
+            vopResultCode = hivpp.resultCode
+            vopDifferentName = hivpp.differentName
+            gotVopId = true
+          if hivpp.pollingId.len > 0:
+            vopPollingId = hivpp.pollingId
+          if hivpp.waitSec > 0:
+            vopWaitSec = hivpp.waitSec
+
+      # Non-polling errors take priority
+      if otherError.len > 0 and not pollError:
+        result.errorCode = otherErrorCode
+        result.errorMsg = otherError
+        return
+
+      if pollError:
+        # Polling not supported (e.g. Atruvia banks).
+        # Bank processes VoP asynchronously and sends SecureGo notification
+        # even without HITAN. Return tanRequired to trigger manual approval.
+        if client.debug:
+          stderr.writeLine "[DEBUG] VoP polling not supported, falling back to async approval"
+        result.tanRequired = true
+        return result
+
+      if gotVopId:
+        stderr.writeLine "Payee verified."
+        break
+
+    if vopId.len == 0:
+      # Polling timed out — fall back to async approval
+      stderr.writeLine "VoP still pending, proceeding with async approval..."
+      result.tanRequired = true
+      return result
+
+  # Handle VoP result codes
+  case vopResultCode
+  of "RVNM":
+    stderr.writeLine "Warning: Payee name does NOT match. Proceed with caution."
+  of "RVMC":
+    if vopDifferentName.len > 0:
+      stderr.writeLine "Note: Payee name is a close match. Bank suggests: " & vopDifferentName
+  of "RVNA":
+    stderr.writeLine "Note: Receiving bank does not support payee verification."
+  of "RCVC", "":
+    discard  # Match or not provided — proceed normally
   else:
-    segments.add buildHKCCS(segNum, client.account, request)
-    transferSegType = "HKCCS"
-  segNum += 1
+    if client.debug:
+      stderr.writeLine "[DEBUG] VoP result code: " & vopResultCode
 
-  # TAN process
-  segments.add buildHKTAN(segNum, "4", transferSegType)
-  segNum += 1
+  # Step 3: Send HKVPA (VoP Auth with vopId) + HKIPZ (transfer again) + HKTAN
+  block:
+    var segments = ""
+    var segNum = 2
+    let secRef = $rand(1000000..9999999)
 
-  # Security footer
-  segments.add buildHNSHA(segNum, 1, client.pin)
+    segments.add buildHNSHK(segNum, secFunc, secRef, client.blz, client.user, client.systemId)
+    segNum += 1
 
-  let response = client.sendMessage(segments)
-  let respSegments = parseAllSegments(response)
+    segments.add buildHKVPA(segNum, vopId)
+    segNum += 1
 
-  # Check response
-  for seg in respSegments:
-    if seg.name == "HIRMG" or seg.name == "HIRMS":
-      for de in respSegments[findSegment(respSegments, seg.name)].data:
-        if de.startsWith("0010") or de.startsWith("0020"):
-          result.success = true
-        elif de.startsWith("0030"):  # TAN required
-          result.tanRequired = true
-        elif de.startsWith("9"):
-          result.success = false
-          result.errorCode = de[0..3]
-          if de.len > 5:
-            result.errorMsg = de[5..^1]
-    elif seg.name == "HITAN":
-      if seg.data.len > 3:
-        result.orderRef = seg.data[3]
-      if seg.data.len > 4:
-        result.tanChallenge = unescapeFintsData(seg.data[4])
+    segments.add buildHKIPZFromPain(segNum, client.account, painXml)
+    segNum += 1
+
+    segments.add buildHKTAN(segNum, "4", "HKIPZ", version = hktanVer)
+    segNum += 1
+
+    segments.add buildHNSHA(segNum, secRef.parseInt, client.pin)
+
+    let response = client.sendMessage(segments, segNum)
+    let respSegments = parseAllSegments(response)
+
+    result = TransferResult(success: false)
+    for seg in respSegments:
+      if seg.name == "HIRMG" or seg.name == "HIRMS":
+        for de in seg.data:
+          let parsed = parseResponse(de)
+          if client.debug:
+            stderr.writeLine "[DEBUG] " & seg.name & ": " & parsed.code & " " & parsed.msg
+          if parsed.code == "0010" or parsed.code == "0020" or parsed.code == "0030":
+            result.success = true
+          elif parsed.code.startsWith("9"):
+            result.errorCode = parsed.code
+            result.errorMsg = parsed.msg
+            return
+      elif seg.name == "HITAN":
+        if client.debug:
+          stderr.writeLine "[DEBUG] HITAN data: " & $seg.data
+        # HITAN v7: process(0) + orderHash(1) + orderRef(2) + challenge(3) + ...
+        if seg.data.len > 2:
+          result.orderRef = seg.data[2]
+        if seg.data.len > 3:
+          result.tanChallenge = seg.data[3]
+        if seg.data.len > 6:
+          result.tanMediaName = seg.data[6]
+        result.tanRequired = true
 
   return result
 
@@ -710,16 +1087,19 @@ proc submitTan*(client: var FintsClient, orderRef: string, tan: string): Transfe
 
   var segments = ""
   var segNum = 2
+  let secRef = $rand(1000000..9999999)
+  let secFunc = if client.selectedTanMethod.len > 0: client.selectedTanMethod else: "999"
 
-  segments.add buildHNSHK(segNum, "999", "1", client.blz, client.user, client.systemId)
+  segments.add buildHNSHK(segNum, secFunc, secRef, client.blz, client.user, client.systemId)
   segNum += 1
 
-  segments.add buildHKTAN(segNum, "2", "", orderRef)
+  let hktanVer = if client.hktanVersion > 0: client.hktanVersion else: 7
+  segments.add buildHKTAN(segNum, "2", "", orderRef, version = hktanVer)
   segNum += 1
 
-  segments.add buildHNSHA(segNum, 1, client.pin, tan)
+  segments.add buildHNSHA(segNum, secRef.parseInt, client.pin, tan)
 
-  let response = client.sendMessage(segments)
+  let response = client.sendMessage(segments, segNum)
   let respSegments = parseAllSegments(response)
 
   for seg in respSegments:
@@ -736,13 +1116,60 @@ proc submitTan*(client: var FintsClient, orderRef: string, tan: string): Transfe
 
 # --- Convenience functions ---
 
+proc pollDecoupledTan*(client: var FintsClient, orderRef: string): TransferResult =
+  ## Poll for decoupled TAN confirmation (SecureGo plus etc.)
+  result = TransferResult(success: false)
+
+  let secFunc = if client.selectedTanMethod.len > 0: client.selectedTanMethod else: "999"
+  let hktanVer = if client.hktanVersion > 0: client.hktanVersion else: 7
+
+  for attempt in 0 ..< 30:  # Max 60 seconds
+    sleep(2000)
+    if client.debug:
+      stderr.writeLine "[DEBUG] Polling decoupled TAN, attempt " & $(attempt + 1)
+
+    var segments = ""
+    var segNum = 2
+    let secRef = $rand(1000000..9999999)
+
+    segments.add buildHNSHK(segNum, secFunc, secRef, client.blz, client.user, client.systemId)
+    segNum += 1
+
+    segments.add buildHKTAN(segNum, "S", "", orderRef, version = hktanVer)
+    segNum += 1
+
+    segments.add buildHNSHA(segNum, secRef.parseInt, client.pin)
+
+    let response = client.sendMessage(segments, segNum)
+    let respSegments = parseAllSegments(response)
+
+    for seg in respSegments:
+      if seg.name == "HIRMG" or seg.name == "HIRMS":
+        for de in seg.data:
+          let parsed = parseResponse(de)
+          if client.debug:
+            stderr.writeLine "[DEBUG] Poll " & seg.name & ": " & parsed.code & " " & parsed.msg
+          if parsed.code == "0010" or parsed.code == "0020" or parsed.code == "0030":
+            result.success = true
+          elif parsed.code == "3955":
+            discard  # Still pending - continue polling
+          elif parsed.code.startsWith("9"):
+            result.errorCode = parsed.code
+            result.errorMsg = parsed.msg
+            return
+
+    if result.success:
+      return
+
+  result.errorMsg = "Decoupled TAN confirmation timed out"
+
 proc makeTransfer*(url, blz, user, pin: string,
                    senderIban, senderBic, senderName: string,
                    recipientIban, recipientBic, recipientName: string,
                    amount: float, reference: string,
                    instant: bool = true,
                    debug: bool = false): TransferResult =
-  ## Convenience function for one-shot transfer
+  ## Execute a complete transfer including TAN handling
   var client = newFintsClient(url, blz, user, pin)
   client.debug = debug
   defer: client.close()
@@ -765,4 +1192,28 @@ proc makeTransfer*(url, blz, user, pin: string,
   )
 
   result = client.transfer(request)
+
+  # Handle decoupled TAN (SecureGo plus)
+  if result.tanRequired:
+    if result.orderRef.len > 0:
+      # We have an order reference - poll for completion
+      stderr.writeLine "Waiting for TAN confirmation (approve on your device)..."
+      if result.tanChallenge.len > 0:
+        stderr.writeLine result.tanChallenge
+      result = client.pollDecoupledTan(result.orderRef)
+    else:
+      # No order reference (VoP pending case) - bank sends auth to device
+      # but doesn't return HITAN. User must approve on their app.
+      stderr.writeLine ""
+      if result.tanChallenge.len > 0:
+        stderr.writeLine result.tanChallenge
+      else:
+        stderr.writeLine "Approve the transfer on your banking app (SecureGo plus)"
+      stderr.writeLine "Press Enter after approving..."
+      try:
+        discard stdin.readLine()
+      except EOFError:
+        discard
+      result.success = true
+
   client.endDialog()

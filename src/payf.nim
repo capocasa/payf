@@ -88,22 +88,6 @@ proc transfer(
     debug = debug
   )
 
-  if txResult.tanRequired:
-    echo ""
-    echo "TAN required:"
-    if txResult.tanChallenge.len > 0:
-      echo txResult.tanChallenge
-    stdout.write "Enter TAN: "
-    stdout.flushFile()
-    let tan = stdin.readLine().strip()
-    if tan.len == 0:
-      echo "Aborted"
-      return 1
-
-    # TODO: Submit TAN - requires maintaining client session
-    echo "TAN submission not yet implemented for multi-step auth"
-    return 1
-
   if txResult.success:
     echo ""
     echo "Transfer successful!"
