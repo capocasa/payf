@@ -258,7 +258,7 @@ proc buildHKTAN(segNum: int, tanProcess: string, segmentType: string = "", order
   of "2":  # Submit TAN
     data = @[tanProcess, "", "", "", escapeFintsData(orderRef)]
   of "S":  # Check decoupled status
-    data = @[tanProcess, "", "", "", escapeFintsData(orderRef)]
+    data = @[tanProcess, "", "", "", escapeFintsData(orderRef), "N"]
   else:
     data = @[tanProcess]
   result = buildSegment("HKTAN", version, segNum, data)
@@ -889,10 +889,12 @@ proc transfer*(client: var FintsClient, request: TransferRequest): TransferResul
             let msgParts = parsed.msg.split(':')
             if msgParts.len >= 2 and msgParts[^1].len > 0:
               vopOffset = msgParts[^1]
+          elif parsed.code == "9050":
+            discard  # Generic "message has errors" — check HIRMS for details
           elif parsed.code.startsWith("9"):
+            # Prefer HIRMS-specific errors over earlier generic ones
             result.errorCode = parsed.code
             result.errorMsg = parsed.msg
-            return
       elif seg.name == "HITAN":
         if client.debug:
           stderr.writeLine "[DEBUG] HITAN data: " & $seg.data
@@ -911,6 +913,10 @@ proc transfer*(client: var FintsClient, request: TransferRequest): TransferResul
         vopWaitSec = hivpp.waitSec
         vopResultCode = hivpp.resultCode
         vopDifferentName = hivpp.differentName
+
+    if result.errorCode.len > 0:
+      result.success = false
+      return result
 
     # If bank skips VoP auth (3091) or no VoP required, we're done
     if skipVopAuth or not client.vopRequired:
@@ -1055,6 +1061,7 @@ proc transfer*(client: var FintsClient, request: TransferRequest): TransferResul
     let respSegments = parseAllSegments(response)
 
     result = TransferResult(success: false)
+    var scaNotRequired = false
     for seg in respSegments:
       if seg.name == "HIRMG" or seg.name == "HIRMS":
         for de in seg.data:
@@ -1063,14 +1070,16 @@ proc transfer*(client: var FintsClient, request: TransferRequest): TransferResul
             stderr.writeLine "[DEBUG] " & seg.name & ": " & parsed.code & " " & parsed.msg
           if parsed.code == "0010" or parsed.code == "0020" or parsed.code == "0030":
             result.success = true
+          elif parsed.code == "3076":
+            scaNotRequired = true
+          elif parsed.code == "9050":
+            discard  # Generic "message has errors" — check HIRMS for details
           elif parsed.code.startsWith("9"):
             result.errorCode = parsed.code
             result.errorMsg = parsed.msg
-            return
       elif seg.name == "HITAN":
         if client.debug:
           stderr.writeLine "[DEBUG] HITAN data: " & $seg.data
-        # HITAN v7: process(0) + orderHash(1) + orderRef(2) + challenge(3) + ...
         if seg.data.len > 2:
           result.orderRef = seg.data[2]
         if seg.data.len > 3:
@@ -1078,6 +1087,14 @@ proc transfer*(client: var FintsClient, request: TransferRequest): TransferResul
         if seg.data.len > 6:
           result.tanMediaName = seg.data[6]
         result.tanRequired = true
+
+    # 3076 = SCA not required — transfer already complete
+    if scaNotRequired:
+      result.tanRequired = false
+
+    if result.errorCode.len > 0:
+      result.success = false
+      return result
 
   return result
 
@@ -1118,6 +1135,8 @@ proc submitTan*(client: var FintsClient, orderRef: string, tan: string): Transfe
 
 proc pollDecoupledTan*(client: var FintsClient, orderRef: string): TransferResult =
   ## Poll for decoupled TAN confirmation (SecureGo plus etc.)
+  ## Returns success=true if bank confirms, errorCode="POLL_UNSUPPORTED" if
+  ## bank doesn't support HKTAN process "S" polling.
   result = TransferResult(success: false)
 
   let secFunc = if client.selectedTanMethod.len > 0: client.selectedTanMethod else: "999"
@@ -1143,6 +1162,7 @@ proc pollDecoupledTan*(client: var FintsClient, orderRef: string): TransferResul
     let response = client.sendMessage(segments, segNum)
     let respSegments = parseAllSegments(response)
 
+    var stillPending = false
     for seg in respSegments:
       if seg.name == "HIRMG" or seg.name == "HIRMS":
         for de in seg.data:
@@ -1151,14 +1171,28 @@ proc pollDecoupledTan*(client: var FintsClient, orderRef: string): TransferResul
             stderr.writeLine "[DEBUG] Poll " & seg.name & ": " & parsed.code & " " & parsed.msg
           if parsed.code == "0010" or parsed.code == "0020" or parsed.code == "0030":
             result.success = true
-          elif parsed.code == "3955":
-            discard  # Still pending - continue polling
+          elif parsed.code == "3955" or parsed.code == "3956":
+            stillPending = true  # Decoupled auth still pending
+          elif parsed.code == "9050":
+            discard  # Generic "message has errors" — check HIRMS for details
+          elif parsed.code == "9110" or parsed.code == "9100":
+            # Bank doesn't support HKTAN process "S" polling
+            if client.debug:
+              stderr.writeLine "[DEBUG] Bank does not support decoupled TAN polling"
+            result.errorCode = "POLL_UNSUPPORTED"
+            result.errorMsg = "Bank does not support status polling"
+            return
           elif parsed.code.startsWith("9"):
             result.errorCode = parsed.code
             result.errorMsg = parsed.msg
             return
 
     if result.success:
+      return
+
+    if not stillPending and not result.success:
+      # No success and no pending status — unexpected state
+      result.errorMsg = "Unexpected response during TAN polling"
       return
 
   result.errorMsg = "Decoupled TAN confirmation timed out"
@@ -1195,25 +1229,31 @@ proc makeTransfer*(url, blz, user, pin: string,
 
   # Handle decoupled TAN (SecureGo plus)
   if result.tanRequired:
-    if result.orderRef.len > 0:
-      # We have an order reference - poll for completion
-      stderr.writeLine "Waiting for TAN confirmation (approve on your device)..."
-      if result.tanChallenge.len > 0:
-        stderr.writeLine result.tanChallenge
-      result = client.pollDecoupledTan(result.orderRef)
+    if result.tanChallenge.len > 0 and result.tanChallenge != "nochallenge":
+      stderr.writeLine result.tanChallenge
     else:
-      # No order reference (VoP pending case) - bank sends auth to device
-      # but doesn't return HITAN. User must approve on their app.
-      stderr.writeLine ""
-      if result.tanChallenge.len > 0:
-        stderr.writeLine result.tanChallenge
+      stderr.writeLine "Approve the transfer on your banking app (SecureGo plus)"
+
+    if result.orderRef.len > 0:
+      # Poll bank for decoupled TAN confirmation
+      stderr.writeLine "Waiting for approval..."
+      let pollResult = client.pollDecoupledTan(result.orderRef)
+      if pollResult.success:
+        result = pollResult
+      elif pollResult.errorCode == "POLL_UNSUPPORTED":
+        # Bank doesn't support HKTAN process "S" polling — ask user
+        stderr.writeLine "Press Enter after approving..."
+        try: discard stdin.readLine()
+        except EOFError: discard
+        # Bank already confirmed acceptance (0020) in Step 3
+        result.success = true
       else:
-        stderr.writeLine "Approve the transfer on your banking app (SecureGo plus)"
+        result = pollResult
+    else:
+      # No order reference — ask user to confirm manually
       stderr.writeLine "Press Enter after approving..."
-      try:
-        discard stdin.readLine()
-      except EOFError:
-        discard
+      try: discard stdin.readLine()
+      except EOFError: discard
       result.success = true
 
   client.endDialog()
