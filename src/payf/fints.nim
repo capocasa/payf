@@ -53,6 +53,10 @@ type
     hicazCamtUrn*: string  # camt URN for HICAZ (e.g., urn:iso:std:iso:20022:tech:xsd:camt.052.001.08)
     vopReportFormat*: string  # VoP report format from HIVPPS
     vopRequired*: bool  # Whether VoP is required for transfers
+    needsHksyn*: bool  # Whether bank requires system ID synchronization
+    decoupledMaxPolls*: int  # Max status requests (0=unlimited, from HITANS BPD)
+    decoupledFirstPollSec*: int  # Seconds before first poll (from HITANS BPD)
+    decoupledNextPollSec*: int  # Seconds between polls (from HITANS BPD)
     debug*: bool
     http: HttpClient
 
@@ -99,6 +103,7 @@ type
 proc buildSegment(name: string, version, num: int, data: seq[string]): string
 proc escapeFintsData*(s: string): string
 proc parseSegments(msg: string): seq[tuple[name: string, version, num: int, data: seq[string]]]
+proc endDialog*(client: var FintsClient)
 
 # --- Utility functions ---
 
@@ -287,6 +292,12 @@ proc buildHKTAN(segNum: int, tanProcess: string, segmentType: string = "", order
     data = @[tanProcess]
   result = buildSegment("HKTAN", version, segNum, data)
 
+proc buildHKSYN(segNum: int, mode: int = 0): string =
+  ## Synchronization segment (Synchronisierung)
+  ## mode: 0 = request new system ID, 1 = last message number, 2 = signature ID
+  let data = @[$mode]
+  result = buildSegment("HKSYN", 3, segNum, data)
+
 proc buildHKVPP(segNum: int, reportFormat: string, pollingId: string = "", offset: string = ""): string =
   ## VoP name check request (Namensabgleich Prüfauftrag)
   ## HKVPP1 fields: supported_reports, polling_id, max_queries, offset
@@ -356,7 +367,9 @@ proc buildHKCAZ(segNum: int, account: Account, fromDate, toDate: string, camtUrn
   var kti = account.iban
   if account.bic.len > 0:
     kti.add(":" & account.bic)
-  var data = @[kti, camtUrn, "N", fromDate, toDate]
+  # Escape colons in camt URN (colons are FinTS DEG separators)
+  let escapedUrn = escapeFintsData(camtUrn)
+  var data = @[kti, escapedUrn, "N", fromDate, toDate]
   if offset.len > 0:
     data.add(offset)
   result = buildSegment("HKCAZ", version, segNum, data)
@@ -986,22 +999,28 @@ proc sendMessage(client: var FintsClient, segments: string, lastSegNum: int): st
     stderr.writeLine "[DEBUG] Sending to: " & client.url
     stderr.writeLine "[DEBUG] Request: " & msg[0 .. min(500, msg.len - 1)] & "..."
 
+  var response: string
   try:
-    let response = client.http.postContent(client.url, body = encoded)
-    try:
-      # Strip whitespace/newlines — some banks return MIME-style base64
-      let cleaned = response.replace("\r", "").replace("\n", "").strip()
-      result = decode(cleaned)
-    except:
-      if client.debug:
-        stderr.writeLine "[DEBUG] Raw response (not base64): " & response[0 .. min(500, response.len - 1)]
-      raise newException(FintsError, "Invalid base64 response from bank")
-    if client.debug:
-      stderr.writeLine "[DEBUG] Response: " & result[0 .. min(1000, result.len - 1)] & "..."
-  except FintsError:
-    raise
+    response = client.http.postContent(client.url, body = encoded)
   except:
-    raise newException(FintsError, "HTTP request failed: " & getCurrentExceptionMsg())
+    # Reconnect once on connection failure (bank may close idle connections)
+    if client.debug:
+      stderr.writeLine "[DEBUG] Connection failed, reconnecting: " & getCurrentExceptionMsg()
+    client.reconnect()
+    try:
+      response = client.http.postContent(client.url, body = encoded)
+    except:
+      raise newException(FintsError, "HTTP request failed: " & getCurrentExceptionMsg())
+  try:
+    # Strip whitespace/newlines — some banks return MIME-style base64
+    let cleaned = response.replace("\r", "").replace("\n", "").strip()
+    result = decode(cleaned)
+  except:
+    if client.debug:
+      stderr.writeLine "[DEBUG] Raw response (not base64): " & response[0 .. min(500, response.len - 1)]
+    raise newException(FintsError, "Invalid base64 response from bank")
+  if client.debug:
+    stderr.writeLine "[DEBUG] Response: " & result[0 .. min(1000, result.len - 1)] & "..."
 
 proc parseResponse(de: string): tuple[code: string, refSeg: string, msg: string] =
   ## Parse HIRMG/HIRMS data element: "code:refSeg:message" or "code::message"
@@ -1040,6 +1059,11 @@ proc initDialog*(client: var FintsClient): bool =
   segments.add buildHKVVB(segNum, 0, 0)
   segNum += 1
 
+  # Synchronize system ID if requested
+  if client.needsHksyn and client.systemId == "0":
+    segments.add buildHKSYN(segNum, 0)
+    segNum += 1
+
   # TAN process (only for two-step auth when TAN method is known)
   if client.selectedTanMethod.len > 0:
     segments.add buildHKTAN(segNum, "4", "HKIDN", version = client.hktanVersion)
@@ -1068,6 +1092,16 @@ proc initDialog*(client: var FintsClient): bool =
           errors.add(parsed.code & ": " & parsed.msg)
 
   if errors.len > 0:
+    # Check if bank requires system ID synchronization
+    for err in errors:
+      if "9391" in err:
+        if not client.needsHksyn:
+          client.needsHksyn = true
+          client.dialogId = "0"
+          client.msgNum = 0
+          if client.debug:
+            stderr.writeLine "[DEBUG] Bank requires HKSYN, retrying with system ID sync..."
+          return client.initDialog()
     raise newException(FintsError, "Dialog initialization failed: " & errors.join("; "))
 
   # Parse TAN method from HIRMS 3920 response
@@ -1126,8 +1160,8 @@ proc initDialog*(client: var FintsClient): bool =
               client.vopReportFormat = afterUrn
           if client.debug:
             stderr.writeLine "[DEBUG] VoP required, report format: " & client.vopReportFormat
-    elif seg.name == "HIEKAS":
-      # HIEKAS is the BPD parameter segment for HKKAZ (account statements)
+    elif seg.name == "HIKAZS":
+      # HIKAZS is the BPD parameter segment for HKKAZ (account statements)
       # Store the highest supported version
       if seg.version > client.hkkazVersion:
         client.hkkazVersion = seg.version
@@ -1142,6 +1176,7 @@ proc initDialog*(client: var FintsClient): bool =
           let paramData = seg.data[3]
           # URN looks like: urn:iso:std:iso:20022:tech:xsd:camt.052.001.08
           # Note: colons are part of the URN, only terminate on FinTS separators
+          # Extract the last camt URN (banks may list multiple versions)
           let urnStart = paramData.find("urn:")
           if urnStart >= 0:
             var urnEnd = paramData.len
@@ -1149,9 +1184,21 @@ proc initDialog*(client: var FintsClient): bool =
               let pos = paramData.find(ch, urnStart)
               if pos > 0 and pos < urnEnd:
                 urnEnd = pos
-            client.hicazCamtUrn = paramData[urnStart ..< urnEnd]
+            let allUrns = paramData[urnStart ..< urnEnd]
+            # Multiple URNs may be colon-separated; take the last one
+            let lastUrn = allUrns.rfind(":urn:")
+            if lastUrn >= 0:
+              client.hicazCamtUrn = allUrns[lastUrn + 1 .. ^1]
+            else:
+              client.hicazCamtUrn = allUrns
         if client.debug:
           stderr.writeLine "[DEBUG] HICAZ version " & $seg.version & " supported, URN: " & client.hicazCamtUrn
+    elif seg.name == "HISYN":
+      # Synchronization response - extract system ID
+      if seg.data.len > 0 and seg.data[0].len > 0:
+        client.systemId = seg.data[0]
+        if client.debug:
+          stderr.writeLine "[DEBUG] Got system ID: " & client.systemId
     elif seg.name == "HITANS":
       if client.debug:
         stderr.writeLine "[DEBUG] HITANS version " & $seg.version & " data: " & $seg.data
@@ -1159,8 +1206,100 @@ proc initDialog*(client: var FintsClient): bool =
       if client.selectedTanMethod.len > 0 and seg.data.len > 3:
         if client.selectedTanMethod in seg.data[3]:
           client.hktanVersion = seg.version
+          # Parse decoupled timing from TAN method parameters
+          # Fields are colon-separated within DEG; find the selected method's block
+          let paramStr = seg.data[3]
+          let methodPos = paramStr.find(":" & client.selectedTanMethod & ":")
+          if methodPos >= 0:
+            # Split from method start (secfunc is field 1 of TAN2StepParams)
+            let methodFields = paramStr[methodPos + 1 .. ^1].split(':')
+            # Fields: 0=secfunc, ..., 20=nofactivetanmedia, 21=max_polls, 22=first_poll_sec, 23=next_poll_sec
+            if methodFields.len > 23:
+              try:
+                if methodFields[21].len > 0: client.decoupledMaxPolls = parseInt(methodFields[21])
+                if methodFields[22].len > 0: client.decoupledFirstPollSec = parseInt(methodFields[22])
+                if methodFields[23].len > 0: client.decoupledNextPollSec = parseInt(methodFields[23])
+              except ValueError: discard
+              if client.debug:
+                stderr.writeLine "[DEBUG] Decoupled polling: max=" & $client.decoupledMaxPolls &
+                  " first=" & $client.decoupledFirstPollSec & "s next=" & $client.decoupledNextPollSec & "s"
           if client.debug:
             stderr.writeLine "[DEBUG] Using HKTAN version " & $seg.version & " for TAN method " & client.selectedTanMethod
+
+  # Handle decoupled TAN for dialog init (some banks require app approval)
+  var initOrderRef = ""
+  var initTanPending = false
+  for seg in respSegments:
+    if seg.name == "HIRMS":
+      for de in seg.data:
+        let parsed = parseResponse(de)
+        if parsed.code == "3955":
+          initTanPending = true
+    elif seg.name == "HITAN":
+      if seg.data.len > 2 and seg.data[2].len > 0:
+        initOrderRef = seg.data[2]
+
+  if initTanPending and initOrderRef.len > 0:
+    if client.debug:
+      stderr.writeLine "[DEBUG] Dialog init requires decoupled TAN approval, polling..."
+    stderr.writeLine "Please confirm dialog in your banking app..."
+    let secFunc = if client.selectedTanMethod.len > 0: client.selectedTanMethod else: "999"
+    let hktanVer = if client.hktanVersion > 0: client.hktanVersion else: 7
+    var dialogConfirmed = false
+    let maxPolls = if client.decoupledMaxPolls > 0: client.decoupledMaxPolls else: 60
+    let firstPollMs = if client.decoupledFirstPollSec > 0: client.decoupledFirstPollSec * 1000 else: 5000
+    let nextPollMs = if client.decoupledNextPollSec > 0: client.decoupledNextPollSec * 1000 else: 5000
+    if client.debug:
+      stderr.writeLine "[DEBUG] Polling: max=" & $maxPolls & " first=" & $firstPollMs & "ms next=" & $nextPollMs & "ms"
+    for attempt in 0 ..< maxPolls:
+      sleep(if attempt == 0: firstPollMs else: nextPollMs)
+      if client.debug:
+        stderr.writeLine "[DEBUG] Polling dialog TAN, attempt " & $(attempt + 1)
+      var pollSegs = ""
+      var pollSegNum = 2
+      let pollSecRef = $rand(1000000..9999999)
+      pollSegs.add buildHNSHK(pollSegNum, secFunc, pollSecRef, client.blz, client.user, client.systemId)
+      pollSegNum += 1
+      pollSegs.add buildHKTAN(pollSegNum, "S", "", initOrderRef, version = hktanVer)
+      pollSegNum += 1
+      pollSegs.add buildHNSHA(pollSegNum, pollSecRef.parseInt, client.pin)
+      let pollResp = client.sendMessage(pollSegs, pollSegNum)
+      let pollSegments = parseAllSegments(pollResp)
+      var confirmed = false
+      var stillPending = false
+      for seg in pollSegments:
+        if seg.name == "HIRMG" or seg.name == "HIRMS":
+          for de in seg.data:
+            let parsed = parseResponse(de)
+            if client.debug:
+              stderr.writeLine "[DEBUG] Poll " & seg.name & ": " & parsed.code & " " & parsed.msg
+            if parsed.code == "0020" or parsed.code == "0010":
+              confirmed = true
+            elif parsed.code == "3955" or parsed.code == "3956":
+              stillPending = true
+      if confirmed:
+        if client.debug:
+          stderr.writeLine "[DEBUG] Dialog TAN confirmed"
+        dialogConfirmed = true
+        break
+      if not stillPending:
+        raise newException(FintsError, "Dialog TAN confirmation failed")
+    if not dialogConfirmed:
+      raise newException(FintsError, "Dialog TAN confirmation timed out")
+
+  # After HKSYN, the sync dialog cannot be used for operations.
+  # End it and start a fresh dialog with the new system ID.
+  if client.needsHksyn and client.systemId != "0":
+    var gotSyncId = false
+    for seg in respSegments:
+      if seg.name == "HISYN":
+        gotSyncId = true
+        break
+    if gotSyncId:
+      if client.debug:
+        stderr.writeLine "[DEBUG] HKSYN complete, starting fresh dialog with system ID " & client.systemId
+      client.endDialog()
+      return client.initDialog()
 
   return true
 
@@ -1226,10 +1365,12 @@ proc transfer*(client: var FintsClient, request: TransferRequest): TransferResul
   # Ensure dialog is initialized with proper TAN method
   if client.dialogId == "0":
     try:
-      # First dialog: discover TAN methods and BPD (one-step auth)
+      let oldSystemId = client.systemId
+      # First dialog: discover TAN methods, BPD, and system ID
       discard client.initDialog()
-      # If we discovered a TAN method, re-init with proper two-step auth
-      if client.selectedTanMethod.len > 0 and client.selectedTanMethod != "999":
+      # Re-init if we got a new system ID or discovered a TAN method
+      if (client.selectedTanMethod.len > 0 and client.selectedTanMethod != "999") or
+         (oldSystemId == "0" and client.systemId != "0"):
         client.endDialog()
         discard client.initDialog()
     except FintsError as e:
@@ -1550,8 +1691,11 @@ proc pollDecoupledTan*(client: var FintsClient, orderRef: string): TransferResul
   let secFunc = if client.selectedTanMethod.len > 0: client.selectedTanMethod else: "999"
   let hktanVer = if client.hktanVersion > 0: client.hktanVersion else: 7
 
-  for attempt in 0 ..< 30:  # Max 60 seconds
-    sleep(2000)
+  let maxPolls = if client.decoupledMaxPolls > 0: client.decoupledMaxPolls else: 60
+  let firstPollMs = if client.decoupledFirstPollSec > 0: client.decoupledFirstPollSec * 1000 else: 5000
+  let nextPollMs = if client.decoupledNextPollSec > 0: client.decoupledNextPollSec * 1000 else: 5000
+  for attempt in 0 ..< maxPolls:
+    sleep(if attempt == 0: firstPollMs else: nextPollMs)
     if client.debug:
       stderr.writeLine "[DEBUG] Polling decoupled TAN, attempt " & $(attempt + 1)
 
@@ -1613,8 +1757,11 @@ proc pollDecoupledStatements*(client: var FintsClient, orderRef: string): Statem
   let secFunc = if client.selectedTanMethod.len > 0: client.selectedTanMethod else: "999"
   let hktanVer = if client.hktanVersion > 0: client.hktanVersion else: 7
 
-  for attempt in 0 ..< 30:  # Max 60 seconds
-    sleep(2000)
+  let maxPolls = if client.decoupledMaxPolls > 0: client.decoupledMaxPolls else: 60
+  let firstPollMs = if client.decoupledFirstPollSec > 0: client.decoupledFirstPollSec * 1000 else: 5000
+  let nextPollMs = if client.decoupledNextPollSec > 0: client.decoupledNextPollSec * 1000 else: 5000
+  for attempt in 0 ..< maxPolls:
+    sleep(if attempt == 0: firstPollMs else: nextPollMs)
     if client.debug:
       stderr.writeLine "[DEBUG] Polling decoupled TAN for statements, attempt " & $(attempt + 1)
 
@@ -1659,7 +1806,7 @@ proc pollDecoupledStatements*(client: var FintsClient, orderRef: string): Statem
             return
 
       elif seg.name == "HICAZ":
-        # Statements might come back with polling response
+        # Statements might come back with polling response (camt format)
         for dataElem in seg.data:
           if dataElem.len > 0 and dataElem.startsWith("@"):
             let camtData = extractBinary(dataElem)
@@ -1669,6 +1816,16 @@ proc pollDecoupledStatements*(client: var FintsClient, orderRef: string): Statem
               let txs = parseCamt(camtData)
               result.transactions.add(txs)
               break
+
+      elif seg.name == "HIKAZ":
+        # Statements might come back with polling response (MT940 format)
+        if seg.data.len > 0:
+          let mt940Data = extractBinary(seg.data[0])
+          if mt940Data.len > 0:
+            if client.debug:
+              stderr.writeLine "[DEBUG] Got MT940 data in poll response"
+            let txs = parseMT940(mt940Data)
+            result.transactions.add(txs)
 
     if result.success:
       return
@@ -1725,7 +1882,7 @@ proc getStatementsHICAZ(client: var FintsClient, fromDate, toDate: string, withT
           let parsed = parseResponse(de)
           if client.debug:
             stderr.writeLine "[DEBUG] " & seg.name & ": " & parsed.code & " " & parsed.msg
-          if parsed.code == "0010" or parsed.code == "0020":
+          if parsed.code == "0010" or parsed.code == "0020" or parsed.code == "3010":
             result.success = true
           elif parsed.code == "3040":
             gotMore = true
@@ -1749,11 +1906,11 @@ proc getStatementsHICAZ(client: var FintsClient, fromDate, toDate: string, withT
         # HITAN contains TAN challenge/order reference for decoupled TAN
         if client.debug:
           stderr.writeLine "[DEBUG] HITAN data: " & $seg.data
-        if seg.data.len > 2:
+        if seg.data.len > 2 and seg.data[2] != "noref":
           result.orderRef = seg.data[2]
-        if seg.data.len > 3:
-          result.tanChallenge = seg.data[3]
-        result.tanRequired = true
+          if seg.data.len > 3 and seg.data[3] != "nochallenge":
+            result.tanChallenge = seg.data[3]
+          result.tanRequired = true
 
       elif seg.name == "HICAZ":
         # HICAZ contains camt XML data in binary format
@@ -1790,12 +1947,14 @@ proc getStatementsHICAZ(client: var FintsClient, fromDate, toDate: string, withT
 
   result.success = true
 
-proc getStatementsHKKAZ(client: var FintsClient, fromDate, toDate: string): StatementResult =
+proc getStatementsHKKAZ(client: var FintsClient, fromDate, toDate: string, withTan: bool = true): StatementResult =
   ## Fetch account statements via HKKAZ (MT940 format)
+  ## withTan: if true, include HKTAN for decoupled TAN flow
   result = StatementResult(success: false, transactions: @[])
 
   let secFunc = if client.selectedTanMethod.len > 0: client.selectedTanMethod else: "999"
   let hkkazVer = if client.hkkazVersion > 0: client.hkkazVersion else: 7
+  let hktanVer = if client.hktanVersion > 0: client.hktanVersion else: 7
   var offset = ""
 
   if client.debug:
@@ -1811,6 +1970,10 @@ proc getStatementsHKKAZ(client: var FintsClient, fromDate, toDate: string): Stat
 
     segments.add buildHKKAZ(segNum, client.account, fromDate, toDate, offset, hkkazVer)
     segNum += 1
+
+    if withTan:
+      segments.add buildHKTAN(segNum, "4", "HKKAZ", version = hktanVer)
+      segNum += 1
 
     segments.add buildHNSHA(segNum, secRef.parseInt, client.pin)
 
@@ -1828,13 +1991,16 @@ proc getStatementsHKKAZ(client: var FintsClient, fromDate, toDate: string): Stat
           let parsed = parseResponse(de)
           if client.debug:
             stderr.writeLine "[DEBUG] " & seg.name & ": " & parsed.code & " " & parsed.msg
-          if parsed.code == "0010" or parsed.code == "0020":
+          if parsed.code == "0010" or parsed.code == "0020" or parsed.code == "3010":
             result.success = true
           elif parsed.code == "3040":
             gotMore = true
             let msgParts = parsed.msg.split(':')
             if msgParts.len >= 2 and msgParts[^1].len > 0:
               newOffset = msgParts[^1]
+          elif parsed.code == "9370":
+            # TAN required
+            result.tanRequired = true
           elif parsed.code.startsWith("9"):
             if seg.name == "HIRMS":
               # HIRMS errors are more specific, use them directly
@@ -1845,6 +2011,15 @@ proc getStatementsHKKAZ(client: var FintsClient, fromDate, toDate: string): Stat
               # Store HIRMG error as fallback
               hirmgError = (parsed.code, parsed.msg)
 
+      elif seg.name == "HITAN":
+        if client.debug:
+          stderr.writeLine "[DEBUG] HITAN data: " & $seg.data
+        if seg.data.len > 2 and seg.data[2] != "noref":
+          result.orderRef = seg.data[2]
+          if seg.data.len > 3 and seg.data[3] != "nochallenge":
+            result.tanChallenge = seg.data[3]
+          result.tanRequired = true
+
       elif seg.name == "HIKAZ":
         # HIKAZ contains MT940 data in binary format
         if seg.data.len > 0:
@@ -1852,6 +2027,10 @@ proc getStatementsHKKAZ(client: var FintsClient, fromDate, toDate: string): Stat
           if mt940Data.len > 0:
             let txs = parseMT940(mt940Data)
             result.transactions.add(txs)
+
+    # If TAN required and we have orderRef, return for polling
+    if result.tanRequired and result.orderRef.len > 0:
+      return
 
     # If HIRMG error but no HIRMS error, use HIRMG
     if hirmgError[0].len > 0:
@@ -1873,8 +2052,11 @@ proc getStatements*(client: var FintsClient, fromDate, toDate: string): Statemen
   # Ensure dialog is initialized
   if client.dialogId == "0":
     try:
+      let oldSystemId = client.systemId
       discard client.initDialog()
-      if client.selectedTanMethod.len > 0 and client.selectedTanMethod != "999":
+      # Re-init if we got a new system ID or discovered a TAN method
+      if (client.selectedTanMethod.len > 0 and client.selectedTanMethod != "999") or
+         (oldSystemId == "0" and client.systemId != "0"):
         client.endDialog()
         discard client.initDialog()
     except FintsError as e:
@@ -1936,13 +2118,37 @@ proc getStatements*(client: var FintsClient, fromDate, toDate: string): Statemen
   if client.hkkazVersion > 0:
     if client.debug:
       stderr.writeLine "[DEBUG] Trying HKKAZ (MT940 format)..."
-    result = client.getStatementsHKKAZ(fromDate, toDate)
-    if result.success:
-      return
-    # If HKKAZ also failed and HICAZ needed TAN but no orderRef, report that
-    if hicazResult.tanRequired and hicazResult.orderRef.len == 0:
-      result.errorCode = "9370"
-      result.errorMsg = "Bank requires TAN but didn't provide order reference"
+    let hkkazResult = client.getStatementsHKKAZ(fromDate, toDate)
+    if hkkazResult.success:
+      return hkkazResult
+
+    # Handle decoupled TAN for HKKAZ
+    if hkkazResult.tanRequired and hkkazResult.orderRef.len > 0:
+      if client.debug:
+        stderr.writeLine "[DEBUG] TAN required for HKKAZ statement retrieval"
+      if hkkazResult.tanChallenge.len > 0 and hkkazResult.tanChallenge != "nochallenge":
+        stderr.writeLine hkkazResult.tanChallenge
+      else:
+        stderr.writeLine "Please confirm statement retrieval in your banking app..."
+      let pollResult = client.pollDecoupledStatements(hkkazResult.orderRef)
+      if pollResult.success:
+        if pollResult.transactions.len > 0:
+          return pollResult
+        let retryResult = client.getStatementsHKKAZ(fromDate, toDate, withTan = false)
+        if retryResult.success:
+          return retryResult
+        return retryResult
+      elif pollResult.errorCode == "POLL_UNSUPPORTED":
+        stderr.writeLine "Bank doesn't support automatic confirmation. Press Enter after confirming in app..."
+        discard stdin.readLine()
+        let retryResult = client.getStatementsHKKAZ(fromDate, toDate, withTan = false)
+        if retryResult.success:
+          return retryResult
+        return retryResult
+      else:
+        return pollResult
+
+    result = hkkazResult
     return
 
   # HICAZ was tried but failed, use its error

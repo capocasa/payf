@@ -388,10 +388,10 @@ proc list(
     stderr.writeLine "Error: " & parsedTo.err
     return 1
 
-  # Default date range: last 30 days
+  # Default date range: today
   let today = now()
   let actualToDate = if parsedTo.date.len > 0: parsedTo.date else: today.format("yyyyMMdd")
-  let actualFromDate = if parsedFrom.date.len > 0: parsedFrom.date else: (today - 30.days).format("yyyyMMdd")
+  let actualFromDate = if parsedFrom.date.len > 0: parsedFrom.date else: today.format("yyyyMMdd")
 
   if debug:
     let fromFmt = actualFromDate[0..3] & "-" & actualFromDate[4..5] & "-" & actualFromDate[6..7]
