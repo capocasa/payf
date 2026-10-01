@@ -5,7 +5,7 @@
 ##   payf list [FROM] [TO]
 ##   payf balance
 ##
-## Configuration via .env file or environment variables.
+## Configuration via payf.conf file or environment variables.
 ## Logs to $XDG_DATA_HOME/payf/payf-YYYY.log (disable with PAYF_NO_LOG=1).
 
 import std/[os, strutils, strformat, times, tables]
@@ -36,8 +36,11 @@ proc die(code: int, msg: string) =
   stderr.writeLine "payf: " & msg
   quit code
 
-proc loadValidConfig(envFile: string): Config =
-  result = loadConfig(envFile)
+proc loadValidConfig(confFile: string): Config =
+  try:
+    result = loadConfig(confFile)
+  except CatchableError as e:
+    die 3, "cannot read " & confFile & ": " & e.msg
   let missing = result.validate()
   if missing.len > 0:
     die 3, "missing configuration: " & missing.join(", ")
@@ -52,7 +55,7 @@ proc transfer(
     reference: string = "",
     bic: string = "",
     instant: bool = true,
-    env: string = ".env",
+    conf: string = "payf.conf",
     dryRun: bool = false,
     verbose: bool = false
 ): int =
@@ -72,7 +75,7 @@ proc transfer(
   if amount <= 0:
     die 2, "amount must be greater than 0"
 
-  let cfg = loadValidConfig(env)
+  let cfg = loadValidConfig(conf)
   let l = initLogger(verbose)
   defer: l.close()
   l.info(fmt"transfer {amount:.2f} EUR to {name} ({to}) instant={instant}")
@@ -113,18 +116,18 @@ proc transfer(
   return 5
 
 proc balance(
-    env: string = ".env",
+    conf: string = "payf.conf",
     verbose: bool = false
 ): int =
   ## Query account balance (not yet implemented).
-  let cfg = loadValidConfig(env)
+  let cfg = loadValidConfig(conf)
   discard cfg
   stderr.writeLine "payf: balance not yet implemented"
   return 1
 
 proc list(
     args: seq[string],
-    env: string = ".env",
+    conf: string = "payf.conf",
     sep: string = "\t",
     quote: string = "",
     header: bool = true,
@@ -141,7 +144,7 @@ proc list(
   let fromArg = if args.len >= 1: args[0] else: ""
   let toArg = if args.len >= 2: args[1] else: ""
 
-  let cfg = loadValidConfig(env)
+  let cfg = loadValidConfig(conf)
 
   let parsedFrom = parseFlexDate(fromArg, isEndDate = false)
   if parsedFrom.err.len > 0:
@@ -226,20 +229,20 @@ when isMainModule:
       "reference": "payment reference/description",
       "bic": "recipient BIC (optional)",
       "instant": "use instant transfer (default: on)",
-      "env": "path to .env config file",
+      "conf": "path to payf.conf config file",
       "dryRun": "don't actually send",
       "verbose": "mirror bank protocol to stderr"
     }],
     [list, cmdName = "list", help = {
       "args": "[FROM] [TO]  dates (2024-01-15, aug, 30d, week, ...)",
-      "env": "path to .env config file",
+      "conf": "path to payf.conf config file",
       "sep": "field separator (default: tab)",
       "quote": "quote character (default: none)",
       "header": "include header row",
       "verbose": "mirror bank protocol to stderr"
     }],
     [balance, cmdName = "balance", help = {
-      "env": "path to .env config file",
+      "conf": "path to payf.conf config file",
       "verbose": "mirror bank protocol to stderr"
     }],
     [version, cmdName = "version"]

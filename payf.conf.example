@@ -1,0 +1,13 @@
+# FinTS bank connection
+fints_url=https://your-bank-fints-server/fints30
+fints_blz=12345678
+fints_user=your_username
+
+# PIN: either set directly or via command (e.g. password manager)
+#fints_pin=your_pin
+fints_pin_cmd=pass bankname
+
+# Account details
+iban=DE89370400440532013000
+bic=COBADEFFXXX
+account_holder=Max Mustermann

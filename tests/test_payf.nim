@@ -3,6 +3,7 @@
 import std/[os, unittest, strutils, times]
 import ../src/payf/dates
 import ../src/payf/update
+import ../src/payf/config
 
 suite "flexible date parsing":
   test "ISO date":
@@ -52,6 +53,37 @@ suite "auto-update semver":
     putEnv("PAYF_AUTO_UPDATE", "true")
     check autoUpdateEnabled()
     delEnv("PAYF_AUTO_UPDATE")
+
+suite "config loading":
+  test "reads payf.conf, env overrides":
+    let dir = getTempDir() / "payf-test-conf"
+    removeDir(dir)
+    createDir(dir)
+    let conf = dir / "payf.conf"
+    writeFile(conf, """fints_url=https://bank/fints30
+fints_blz=12345678
+fints_user=carl
+iban=DE89370400440532013000
+bic=GENODEF1XXX
+account_holder=Max Mustermann
+""")
+
+    let cfg = loadConfig(conf)
+    check cfg.fintsUrl == "https://bank/fints30"
+    check cfg.blz == "12345678"
+    check cfg.iban == "DE89370400440532013000"
+    check cfg.accountHolder == "Max Mustermann"
+
+    putEnv("FINTS_USER", "someone-else")
+    let cfg2 = loadConfig(conf)
+    check cfg2.user == "someone-else"
+    delEnv("FINTS_USER")
+    removeDir(dir)
+
+  test "missing file means empty config":
+    let cfg = loadConfig("/nonexistent/payf.conf")
+    check cfg.fintsUrl == ""
+    check cfg.validate().len == 5
 
 suite "output field escaping":
   test "tab-separated replaces separator":

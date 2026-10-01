@@ -1,7 +1,8 @@
-## Configuration handling via .env files and environment variables
+## Configuration via payf.conf (flat `key = value` lines) and environment
+## variables. Environment variables (FINTS_URL, FINTS_PIN, ...) override
+## file values.
 
-import std/[os, osproc, strutils]
-import dotenv
+import std/[os, osproc, strutils, tables]
 
 type
   Config* = object
@@ -21,44 +22,53 @@ proc execCmd(cmd: string): string =
     raise newException(OSError, "Command failed: " & cmd)
   result = output.strip().splitLines()[0]
 
-proc loadConfig*(envFile: string = ".env"): Config =
-  ## Load configuration from .env file with environment variable override
-  # Load .env file (dotenv loads into process environment)
-  if fileExists(envFile):
-    load(filename = envFile)
+proc readConfFile(path: string): Table[string, string] =
+  ## Parse flat `key = value` lines. '#' or ';' starts a comment. The
+  ## whole rest of the line is the value, so URLs need no quoting
+  ## (unlike std/parsecfg, which truncates values at ':').
+  result = initTable[string, string]()
+  for line in readFile(path).splitLines():
+    let l = line.strip()
+    if l.len == 0 or l[0] in {'#', ';'}: continue
+    let eq = l.find({'=', ':'})
+    if eq <= 0: continue
+    result[l[0 ..< eq].strip().toLowerAscii] = l[eq + 1 .. ^1].strip()
 
-  # Get PIN from direct value or command
-  var pin = getEnv("FINTS_PIN")
+proc loadConfig*(confFile: string = "payf.conf"): Config =
+  ## Load configuration from a conf file; environment variables of the
+  ## same name (upper-case) override file values.
+  var file: Table[string, string]
+  if fileExists(confFile):
+    file = readConfFile(confFile)
+
+  proc value(key, envVar: string, default = ""): string =
+    let v = getEnv(envVar)
+    if v.len > 0: return v
+    if file.hasKey(key): return file[key]
+    default
+
+  var pin = value("fints_pin", "FINTS_PIN")
   if pin.len == 0:
-    let pinCmd = getEnv("FINTS_PIN_CMD")
+    let pinCmd = value("fints_pin_cmd", "FINTS_PIN_CMD")
     if pinCmd.len > 0:
       pin = execCmd(pinCmd)
 
   result = Config(
-    fintsUrl: getEnv("FINTS_URL"),
-    blz: getEnv("FINTS_BLZ"),
-    user: getEnv("FINTS_USER"),
+    fintsUrl: value("fints_url", "FINTS_URL"),
+    blz: value("fints_blz", "FINTS_BLZ"),
+    user: value("fints_user", "FINTS_USER"),
     pin: pin,
-    iban: getEnv("IBAN"),
-    bic: getEnv("BIC"),
-    accountHolder: getEnv("ACCOUNT_HOLDER"),
-    test: getEnv("TEST", "1") == "1"
+    iban: value("iban", "IBAN"),
+    bic: value("bic", "BIC"),
+    accountHolder: value("account_holder", "ACCOUNT_HOLDER"),
+    test: value("test", "TEST", "1") == "1"
   )
 
 proc validate*(cfg: Config): seq[string] =
   ## Validate configuration, return list of missing fields
   result = @[]
-  if cfg.fintsUrl.len == 0: result.add("FINTS_URL")
-  if cfg.blz.len == 0: result.add("FINTS_BLZ")
-  if cfg.user.len == 0: result.add("FINTS_USER")
-  if cfg.pin.len == 0: result.add("FINTS_PIN")
-  if cfg.iban.len == 0: result.add("IBAN")
-
-proc applyOverrides*(cfg: var Config, url, blz, user, pin, iban, bic: string) =
-  ## Apply command line overrides to config
-  if url.len > 0: cfg.fintsUrl = url
-  if blz.len > 0: cfg.blz = blz
-  if user.len > 0: cfg.user = user
-  if pin.len > 0: cfg.pin = pin
-  if iban.len > 0: cfg.iban = iban
-  if bic.len > 0: cfg.bic = bic
+  if cfg.fintsUrl.len == 0: result.add("fints_url")
+  if cfg.blz.len == 0: result.add("fints_blz")
+  if cfg.user.len == 0: result.add("fints_user")
+  if cfg.pin.len == 0: result.add("fints_pin")
+  if cfg.iban.len == 0: result.add("iban")

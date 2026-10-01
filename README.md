@@ -40,20 +40,23 @@ nimble build
 
 ## Configuration
 
-Copy `.env.example` to `.env` and fill in your bank details:
+Copy `payf.conf.example` to `payf.conf` and fill in your bank details:
 
 ```bash
-cp .env.example .env
+cp payf.conf.example payf.conf
 ```
 
 You need:
-- **FINTS_URL** — your bank's FinTS server URL (ask your bank or check their website)
-- **FINTS_BLZ** — your bank's routing number (Bankleitzahl)
-- **FINTS_USER** — your online banking username
-- **FINTS_PIN** or **FINTS_PIN_CMD** — your PIN, or a command to retrieve it (e.g. `pass bankname`)
-- **IBAN** — your account IBAN
-- **BIC** — your account BIC
-- **ACCOUNT_HOLDER** — your name as registered with the bank
+- **fints_url** — your bank's FinTS server URL (ask your bank or check their website)
+- **fints_blz** — your bank's routing number (Bankleitzahl)
+- **fints_user** — your online banking username
+- **fints_pin** or **fints_pin_cmd** — your PIN, or a command to retrieve it (e.g. `pass bankname`)
+- **iban** — your account IBAN
+- **bic** — your account BIC
+- **account_holder** — your name as registered with the bank
+
+Environment variables of the same name (upper-case: `FINTS_URL`,
+`FINTS_PIN`, ...) override file values.
 
 ## Usage
 
