@@ -34,12 +34,20 @@ proc readConfFile(path: string): Table[string, string] =
     if eq <= 0: continue
     result[l[0 ..< eq].strip().toLowerAscii] = l[eq + 1 .. ^1].strip()
 
-proc loadConfig*(confFile: string = "payf.conf"): Config =
-  ## Load configuration from a conf file; environment variables of the
+proc defaultConfPath*(): string =
+  ## Local ./payf.conf wins, else the per-user
+  ## ~/.config/payf/payf.conf (XDG_CONFIG_HOME respected).
+  if fileExists("payf.conf"): return "payf.conf"
+  getEnv("XDG_CONFIG_HOME", getHomeDir() / ".config") / "payf" / "payf.conf"
+
+proc loadConfig*(confFile: string = ""): Config =
+  ## Load configuration from a conf file ("" = ./payf.conf, falling
+  ## back to ~/.config/payf/payf.conf); environment variables of the
   ## same name (upper-case) override file values.
+  let path = if confFile.len > 0: confFile else: defaultConfPath()
   var file: Table[string, string]
-  if fileExists(confFile):
-    file = readConfFile(confFile)
+  if fileExists(path):
+    file = readConfFile(path)
 
   proc value(key, envVar: string, default = ""): string =
     let v = getEnv(envVar)

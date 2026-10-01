@@ -36,14 +36,15 @@ proc die(code: int, msg: string) =
   stderr.writeLine "payf: " & msg
   quit code
 
-proc loadValidConfig(confFile: string): Config =
+proc loadValidConfig(confArg: string): Config =
+  let confFile = if confArg.len > 0: confArg else: defaultConfPath()
   try:
     result = loadConfig(confFile)
   except CatchableError as e:
     die 3, "cannot read " & confFile & ": " & e.msg
   let missing = result.validate()
   if missing.len > 0:
-    die 3, "missing configuration: " & missing.join(", ")
+    die 3, "missing configuration in " & confFile & ": " & missing.join(", ")
 
 proc hintLog(l: Logger) =
   ## Append a "see logs at ..." hint to the previous error line.
@@ -55,7 +56,7 @@ proc transfer(
     reference: string = "",
     bic: string = "",
     instant: bool = true,
-    conf: string = "payf.conf",
+    conf: string = "",
     dryRun: bool = false,
     verbose: bool = false
 ): int =
@@ -116,7 +117,7 @@ proc transfer(
   return 5
 
 proc balance(
-    conf: string = "payf.conf",
+    conf: string = "",
     verbose: bool = false
 ): int =
   ## Query account balance (not yet implemented).
@@ -127,7 +128,7 @@ proc balance(
 
 proc list(
     args: seq[string],
-    conf: string = "payf.conf",
+    conf: string = "",
     sep: string = "\t",
     quote: string = "",
     header: bool = true,
@@ -229,20 +230,20 @@ when isMainModule:
       "reference": "payment reference/description",
       "bic": "recipient BIC (optional)",
       "instant": "use instant transfer (default: on)",
-      "conf": "path to payf.conf config file",
+      "conf": "path to payf.conf (default: ./payf.conf, else ~/.config/payf/payf.conf)",
       "dryRun": "don't actually send",
       "verbose": "mirror bank protocol to stderr"
     }],
     [list, cmdName = "list", help = {
       "args": "[FROM] [TO]  dates (2024-01-15, aug, 30d, week, ...)",
-      "conf": "path to payf.conf config file",
+      "conf": "path to payf.conf (default: ./payf.conf, else ~/.config/payf/payf.conf)",
       "sep": "field separator (default: tab)",
       "quote": "quote character (default: none)",
       "header": "include header row",
       "verbose": "mirror bank protocol to stderr"
     }],
     [balance, cmdName = "balance", help = {
-      "conf": "path to payf.conf config file",
+      "conf": "path to payf.conf (default: ./payf.conf, else ~/.config/payf/payf.conf)",
       "verbose": "mirror bank protocol to stderr"
     }],
     [version, cmdName = "version"]

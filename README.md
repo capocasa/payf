@@ -58,6 +58,10 @@ You need:
 Environment variables of the same name (upper-case: `FINTS_URL`,
 `FINTS_PIN`, ...) override file values.
 
+The first existing file wins, no merging — `./payf.conf` else
+`~/.config/payf/payf.conf` (`XDG_CONFIG_HOME` respected). Keep one
+bank per file; use `--conf` to pick explicitly.
+
 ## Usage
 
 ```bash

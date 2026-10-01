@@ -85,6 +85,31 @@ account_holder=Max Mustermann
     check cfg.fintsUrl == ""
     check cfg.validate().len == 5
 
+suite "conf file cascade":
+  test "local payf.conf wins, else XDG user conf":
+    let dir = getTempDir() / "payf-test-cascade"
+    removeDir(dir)
+    createDir(dir / "payf")
+    let oldDir = getCurrentDir()
+    setCurrentDir(dir)
+    putEnv("XDG_CONFIG_HOME", dir)
+
+    # no local file -> user conf
+    check defaultConfPath() == dir / "payf" / "payf.conf"
+    writeFile(dir / "payf" / "payf.conf", "fints_url=https://user/fints30\n")
+    check loadConfig("").fintsUrl == "https://user/fints30"
+
+    # local file appears -> it wins, no merging
+    writeFile("payf.conf", "fints_url=https://local/fints30\n")
+    check defaultConfPath() == "payf.conf"
+    let cfg = loadConfig("")
+    check cfg.fintsUrl == "https://local/fints30"
+    check cfg.blz == ""  # user conf value does NOT leak in
+
+    setCurrentDir(oldDir)
+    delEnv("XDG_CONFIG_HOME")
+    removeDir(dir)
+
 suite "output field escaping":
   test "tab-separated replaces separator":
     check escapeField("a\tb", '\t', "") == "a  b"
