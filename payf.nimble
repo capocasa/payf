@@ -12,3 +12,6 @@ bin           = @["payf"]
 requires "nim >= 2.0.0"
 requires "cligen >= 1.6.0"
 requires "dotenv >= 2.0.0"
+requires "finz >= 0.1.0"
+task test, "Run tests":
+  exec "nim c -r --path:src tests/test_payf.nim"

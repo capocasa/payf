@@ -10,5 +10,12 @@ nimcache/
 .vscode/
 .idea/
 *.swp
+
+# Nimble local state
+nimble.paths
+nimble.develop
+nimbledeps
+
 # Test binaries
 tests/test_fints
+tests/test_payf
