@@ -8,12 +8,13 @@
 ## Configuration via .env file or environment variables.
 ## Logs to $XDG_DATA_HOME/payf/payf-YYYY.log (disable with PAYF_NO_LOG=1).
 
-import std/[strutils, strformat, times, tables]
+import std/[os, strutils, strformat, times, tables]
 import cligen
 from finz import makeTransfer, fetchStatements, UiHooks
 import payf/config
 import payf/dates
 import payf/log as payflog
+import payf/update
 
 const NimblePkgVersion {.strdefine.} = "dev"
 
@@ -210,6 +211,15 @@ proc version(): int =
   return 0
 
 when isMainModule:
+  cleanupStaleBinaries()
+  # Detached auto-update worker; strictly silent, runs before everything.
+  let cl = commandLineParams()
+  if cl.len == 1 and cl[0] == "--self-update-check":
+    selfUpdateCheck()
+    quit 0
+  showUpdateNoticeMaybe()
+  spawnBackgroundUpdateMaybe()
+
   dispatchMulti(
     [transfer, cmdName = "transfer", help = {
       "args": "NAME IBAN AMOUNT",

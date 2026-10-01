@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['[0-9]+.[0-9]+.[0-9]+']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact: payf-linux-amd64
+            ext: tar.gz
+          - os: ubuntu-22.04-arm
+            artifact: payf-linux-arm64
+            ext: tar.gz
+          - os: macos-latest
+            artifact: payf-macos-universal
+            ext: tar.gz
+          - os: windows-latest
+            artifact: payf-windows-amd64
+            ext: zip
+
+    runs-on: ${{ matrix.os }}
+    # bash everywhere: pwsh swallows non-zero exit codes from native exes
+    # like nimble on Windows, so a failed build runs on into packaging.
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          # exact version, not stable: same compiler for every rebuild
+          nim-version: '2.2.12'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          # finz is not in the nimble package index; install from git so
+          # the "finz >= 0.1.0" require resolves
+          nimble install -y https://github.com/capocasa/finz
+          nimble install -y --depsOnly
+          # nimble setup writes nimble.paths (dep + src paths) so the
+          # direct `nim c` slice build below resolves imports
+          nimble setup -y
+
+      - name: Compute build flags
+        run: |
+          ver="${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}"
+          flags="-d:NimblePkgVersion=$ver"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            # auto-update on releases only, never on dev/main builds
+            flags="$flags -d:autoUpdate"
+          fi
+          echo "BUILD_FLAGS=$flags" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: nimble build -y -d:release ${{ env.BUILD_FLAGS }}
+
+      - name: Build x86_64 slice and create universal binary (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mv payf payf-arm64
+          rm -rf ~/.cache/nim/payf_r
+          nim c -d:release ${{ env.BUILD_FLAGS }} --passC:"-arch x86_64" --passL:"-arch x86_64" --cpu:amd64 -o:payf-x86_64 src/payf.nim
+          lipo -create payf-arm64 payf-x86_64 -output payf
+          file payf
+
+      - name: Run tests
+        run: nimble test
+
+      - name: Package (Unix)
+        if: matrix.ext == 'tar.gz'
+        run: |
+          mkdir -p ${{ matrix.artifact }}
+          cp payf ${{ matrix.artifact }}/
+          cp README.md LICENSE ${{ matrix.artifact }}/
+          tar czf ${{ matrix.artifact }}.${{ matrix.ext }} ${{ matrix.artifact }}
+
+      - name: Package (Windows)
+        if: matrix.ext == 'zip'
+        run: |
+          mkdir -p ${{ matrix.artifact }}
+          cp payf.exe ${{ matrix.artifact }}/
+          cp README.md LICENSE ${{ matrix.artifact }}/
+          7z a ${{ matrix.artifact }}.zip ${{ matrix.artifact }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.${{ matrix.ext }}
+
+      - name: Upload to payf.capocasa.dev (main builds)
+        # main-branch binaries are served from payf.capocasa.dev/main/builds
+        # for the curl|sh installer; never for PRs or tags
+        if: github.ref == 'refs/heads/main'
+        run: |
+          curl -f --retry 5 --retry-delay 5 \
+            -H "Authorization: Bearer ${{ secrets.RELEASE_SECRET }}" \
+            -F "file=@${{ matrix.artifact }}.${{ matrix.ext }}" \
+            https://payf.capocasa.dev/main/builds/upload.nim
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ github.ref_name }} \
+            --repo ${{ github.repository }} \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            payf-linux-amd64.tar.gz \
+            payf-linux-arm64.tar.gz \
+            payf-macos-universal.tar.gz \
+            payf-windows-amd64.zip

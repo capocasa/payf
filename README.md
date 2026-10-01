@@ -12,6 +12,24 @@ Bank transfers should be easy to script. payf removes the web interface but keep
 
 payf works. Transfers have been tested with real money on Atruvia/VR bank servers. Other FinTS 3.0 servers should work but may need adjustments. Bank onboarding (FinTS server URL, product ID registration) still takes some manual effort.
 
+## Install
+
+Latest main build (macOS / Linux):
+
+```bash
+curl -fsSL https://payf.capocasa.dev/main/install | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://payf.capocasa.dev/main/install.ps1 | iex
+```
+
+Those track `main`. For tagged releases see
+[releases](https://github.com/capocasa/payf/releases). Release binaries
+self-update quietly; opt out with `PAYF_AUTO_UPDATE=false`.
+
 ## Building
 
 Requires [Nim](https://nim-lang.org/) >= 2.0.
