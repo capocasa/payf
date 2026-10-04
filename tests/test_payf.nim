@@ -1,9 +1,41 @@
 ## Tests for payf CLI logic (the FinTS protocol suite lives in ~/p/fint).
 
 import std/[os, unittest, strutils, times]
+import ../src/payf/amounts
 import ../src/payf/dates
 import ../src/payf/update
 import ../src/payf/config
+
+suite "amount parsing":
+  test "plain and both decimal conventions":
+    check parseAmount("10").cents == 1000
+    check parseAmount("10.5").cents == 1050
+    check parseAmount("10,5").cents == 1050
+    check parseAmount("10.50").cents == 1050
+    check parseAmount("10,50").cents == 1050
+    check parseAmount("10000,10").cents == 1000010
+    check parseAmount("10000.10").cents == 1000010
+    check parseAmount("0,01").cents == 1
+
+  test "space grouping is stripped":
+    check parseAmount("1 234,56").cents == 123456
+    check parseAmount("\u00A01\u00A0234,56").cents == 123456
+    check parseAmount(" 10,50 ").cents == 1050
+
+  test "ambiguous forms are rejected":
+    check parseAmount("1.000").err.contains("could be 1,00 or 1000")
+    check parseAmount("10.500").err.contains("could be 10,50 or 10500")
+    check parseAmount("10,000").err.len > 0
+    check parseAmount("1.234").err.len > 0
+    check parseAmount("1.000,50").err.contains("write 1000,50")
+    check parseAmount("1,000.50").err.contains("write 1000,50")
+
+  test "invalid amounts":
+    check parseAmount("abc").err.len > 0
+    check parseAmount("10.").err.len > 0
+    check parseAmount("-5").err.len > 0
+    check parseAmount("").err.len > 0
+    check parseAmount("10.5.3").err.len > 0
 
 suite "flexible date parsing":
   test "ISO date":
@@ -79,6 +111,21 @@ account_holder=Max Mustermann
     check cfg2.user == "someone-else"
     delEnv("FINTS_USER")
     removeDir(dir)
+
+  test "normalizes iban whitespace":
+    let dir = getTempDir() / "payf-test-iban"
+    removeDir(dir)
+    createDir(dir)
+    let conf = dir / "payf.conf"
+    writeFile(conf, "iban = DE89 3704 0044 0532 0130 00\n")
+    check loadConfig(conf).iban == "DE89370400440532013000"
+    putEnv("IBAN", " de12 3456 ")
+    check loadConfig(conf).iban == "DE123456"
+    delEnv("IBAN")
+    removeDir(dir)
+
+    check normalizeIban("de89 3704\t0044 0532 0130 00") == "DE89370400440532013000"
+    check normalizeIban("") == ""
 
   test "missing file means empty config":
     let cfg = loadConfig("/nonexistent/payf.conf")

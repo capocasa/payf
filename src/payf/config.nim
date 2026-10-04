@@ -34,6 +34,13 @@ proc readConfFile(path: string): Table[string, string] =
     if eq <= 0: continue
     result[l[0 ..< eq].strip().toLowerAscii] = l[eq + 1 .. ^1].strip()
 
+proc normalizeIban*(iban: string): string =
+  ## Banks print IBANs grouped with spaces; strip whitespace and
+  ## uppercase so pasted values work verbatim (config and argv both).
+  for c in iban:
+    if not c.isSpaceAscii: result.add c
+  result = toUpperAscii(result)
+
 proc defaultConfPath*(): string =
   ## Local ./payf.conf wins, else the per-user
   ## ~/.config/payf/payf.conf (XDG_CONFIG_HOME respected).
@@ -66,7 +73,7 @@ proc loadConfig*(confFile: string = ""): Config =
     blz: value("fints_blz", "FINTS_BLZ"),
     user: value("fints_user", "FINTS_USER"),
     pin: pin,
-    iban: value("iban", "IBAN"),
+    iban: normalizeIban(value("iban", "IBAN")),
     bic: value("bic", "BIC"),
     accountHolder: value("account_holder", "ACCOUNT_HOLDER"),
     test: value("test", "TEST", "1") == "1"

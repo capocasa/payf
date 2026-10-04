@@ -11,6 +11,7 @@
 import std/[os, strutils, strformat, times, tables]
 import cligen
 from finz import makeTransfer, fetchStatements, UiHooks
+import payf/amounts
 import payf/config
 import payf/dates
 import payf/log as payflog
@@ -67,12 +68,11 @@ proc transfer(
   if args.len != 3:
     die 2, "usage: payf transfer NAME IBAN AMOUNT"
   let name = args[0]
-  let to = args[1]
-  var amount: float
-  try:
-    amount = parseFloat(args[2])
-  except ValueError:
-    die 2, "invalid amount: " & args[2]
+  let to = normalizeIban(args[1])
+  let parsed = parseAmount(args[2])
+  if parsed.err.len > 0:
+    die 2, parsed.err
+  let amount = parsed.cents / 100
   if amount <= 0:
     die 2, "amount must be greater than 0"
 
