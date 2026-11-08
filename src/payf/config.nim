@@ -41,6 +41,32 @@ proc normalizeIban*(iban: string): string =
     if not c.isSpaceAscii: result.add c
   result = toUpperAscii(result)
 
+proc validateIban*(iban: string): string =
+  ## Check IBAN structure and the ISO 13616 mod-97 checksum. Returns ""
+  ## when valid, else a human-readable reason. Catches truncated or
+  ## mistyped IBANs at the boundary, before the bank sees them (a
+  ## truncated IBAN makes the VoP name check hang and end in a raw
+  ## 9000). Input must already be normalized; "" is treated as valid
+  ## so missing-iban stays a config problem.
+  if iban.len == 0: return ""
+  if iban.len < 15 or iban.len > 34:
+    return "expected 15-34 characters, got " & $iban.len & ": " & iban
+  if not (iban[0].isAlphaAscii and iban[1].isAlphaAscii and
+          iban[2].isDigit and iban[3].isDigit):
+    return "must start with country code and check digits: " & iban
+  for c in iban:
+    if not c.isAlphaAscii and not c.isDigit:
+      return "only letters and digits allowed: " & iban
+  var rem = 0
+  for c in iban[4 ..^ 1] & iban[0 ..< 4]:
+    if c.isDigit:
+      rem = (rem * 10 + ord(c) - ord('0')) mod 97
+    else:
+      rem = (rem * 100 + 10 + ord(c) - ord('A')) mod 97
+  if rem != 1:
+    return "checksum failed (mod-97): " & iban
+  return ""
+
 proc defaultConfPath*(): string =
   ## Local ./payf.conf wins, else the per-user
   ## ~/.config/payf/payf.conf (XDG_CONFIG_HOME respected).

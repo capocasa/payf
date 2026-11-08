@@ -46,6 +46,9 @@ proc loadValidConfig(confArg: string): Config =
   let missing = result.validate()
   if missing.len > 0:
     die 3, "missing configuration in " & confFile & ": " & missing.join(", ")
+  let ibanErr = validateIban(result.iban)
+  if ibanErr.len > 0:
+    die 3, "invalid iban in " & confFile & ": " & ibanErr
 
 proc hintLog(l: Logger) =
   ## Append a "see logs at ..." hint to the previous error line.
@@ -69,6 +72,9 @@ proc transfer(
     die 2, "usage: payf transfer NAME IBAN AMOUNT"
   let name = args[0]
   let to = normalizeIban(args[1])
+  let ibanErr = validateIban(to)
+  if ibanErr.len > 0:
+    die 2, "invalid recipient iban: " & ibanErr
   let parsed = parseAmount(args[2])
   if parsed.err.len > 0:
     die 2, parsed.err

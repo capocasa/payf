@@ -86,6 +86,26 @@ suite "auto-update semver":
     check autoUpdateEnabled()
     delEnv("PAYF_AUTO_UPDATE")
 
+suite "iban validation":
+  test "valid ibans pass":
+    check validateIban("DE75700000000071101002") == ""
+    check validateIban("DE89370400440532013000") == ""
+    check validateIban("LU897510000110287619") == ""
+    check validateIban("") == ""
+
+  test "truncated iban fails checksum":
+    # two digits short of DE75700000000071101002; this exact value sent
+    # the bank into an endless 3040 VoP loop ending in 9000
+    let err = validateIban(normalizeIban("DE75 7000 0000 0071 1010"))
+    check err.contains("checksum failed")
+    check err.contains("DE757000000000711010")
+
+  test "structural rejects":
+    check validateIban("DE7570000000007110100Y").len > 0
+    check validateIban("1275700000000071101002").len > 0
+    check validateIban("DE7570000000071101002").len > 0
+    check validateIban("DE75 7000 0000 0071 1010 02").len > 0
+
 suite "config loading":
   test "reads payf.conf, env overrides":
     let dir = getTempDir() / "payf-test-conf"
@@ -131,6 +151,17 @@ account_holder=Max Mustermann
     let cfg = loadConfig("/nonexistent/payf.conf")
     check cfg.fintsUrl == ""
     check cfg.validate().len == 5
+
+  test "config with broken sender iban":
+    let dir = getTempDir() / "payf-test-bad-iban"
+    removeDir(dir)
+    createDir(dir)
+    let conf = dir / "payf.conf"
+    writeFile(conf, "iban = DE757000000000711010\n")
+    let cfg = loadConfig(conf)
+    check cfg.iban == "DE757000000000711010"
+    check validateIban(cfg.iban).contains("checksum failed")
+    removeDir(dir)
 
 suite "conf file cascade":
   test "local payf.conf wins, else XDG user conf":
