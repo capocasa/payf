@@ -19,3 +19,4 @@ nimbledeps
 # Test binaries
 tests/test_fints
 tests/test_payf
+.env
