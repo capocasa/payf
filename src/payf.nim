@@ -2,6 +2,7 @@
 ##
 ## Usage:
 ##   payf transfer "Recipient Name" IBAN AMOUNT [--reference ...] [--no-instant]
+##   payf batch FILE
 ##   payf list [FROM] [TO]
 ##   payf balance
 ##
@@ -10,8 +11,9 @@
 
 import std/[os, strutils, strformat, times, tables]
 import cligen
-from finz import makeTransfer, fetchStatements, UiHooks
+from finz import makeTransfer, makeBatchTransfer, fetchStatements, fetchBalance, UiHooks, TransferRequest
 import payf/amounts
+import payf/batchfile
 import payf/config
 import payf/dates
 import payf/log as payflog
@@ -33,7 +35,7 @@ proc finzHooks(l: Logger): UiHooks =
       except EOFError: discard
   )
 
-proc die(code: int, msg: string) =
+proc die(code: int, msg: string) {.noreturn.} =
   stderr.writeLine "payf: " & msg
   quit code
 
@@ -49,6 +51,9 @@ proc loadValidConfig(confArg: string): Config =
   let ibanErr = validateIban(result.iban)
   if ibanErr.len > 0:
     die 3, "invalid iban in " & confFile & ": " & ibanErr
+  let bicErr = validateBic(result.bic)
+  if bicErr.len > 0:
+    die 3, "invalid bic in " & confFile & ": " & bicErr
 
 proc hintLog(l: Logger) =
   ## Append a "see logs at ..." hint to the previous error line.
@@ -75,6 +80,10 @@ proc transfer(
   let ibanErr = validateIban(to)
   if ibanErr.len > 0:
     die 2, "invalid recipient iban: " & ibanErr
+  let rcptBic = normalizeBic(bic)
+  let bicErr = validateBic(rcptBic)
+  if bicErr.len > 0:
+    die 2, "invalid recipient bic: " & bicErr
   let parsed = parseAmount(args[2])
   if parsed.err.len > 0:
     die 2, parsed.err
@@ -100,7 +109,7 @@ proc transfer(
     senderBic = cfg.bic,
     senderName = cfg.accountHolder,
     recipientIban = to,
-    recipientBic = bic,
+    recipientBic = rcptBic,
     recipientName = name,
     amount = amount,
     reference = reference,
@@ -122,15 +131,115 @@ proc transfer(
   hintLog(l)
   return 5
 
+proc batch(
+    args: seq[string],
+    conf: string = "",
+    dryRun: bool = false,
+    verbose: bool = false
+): int =
+  ## Submit several instant transfers as one batch (SEPA-Sammelüberweisung,
+  ## HKIPM): one pain.001, one TAN for the whole batch. Instant only — the
+  ## bank must advertise HKIPM, there is no non-instant fallback.
+  ##
+  ## Usage: payf batch FILE
+  ## FILE: TSV lines `NAME<TAB>IBAN<TAB>AMOUNT[<TAB>REFERENCE]`, # comments,
+  ## optional `name\tiban\tamount\treference` header line.
+
+  if args.len != 1:
+    die 2, "usage: payf batch FILE"
+  let text =
+    try: readFile(args[0])
+    except CatchableError as e:
+      die 2, "cannot read " & args[0] & ": " & e.msg
+  let parsedFile = parseBatchFile(text)
+  if parsedFile.err.len > 0:
+    die 2, args[0] & ": " & parsedFile.err
+  if parsedFile.rows.len == 0:
+    die 2, args[0] & ": no payments found"
+
+  let cfg = loadValidConfig(conf)
+  let l = initLogger(verbose)
+  defer: l.close()
+  l.info(fmt"batch {parsedFile.rows.len} payments, {parsedFile.totalCents / 100:.2f} EUR instant")
+
+  if dryRun:
+    return 0
+
+  var payments: seq[TransferRequest] = @[]
+  for row in parsedFile.rows:
+    payments.add TransferRequest(
+      recipientName: row.name,
+      recipientIban: row.iban,
+      recipientBic: "",
+      amount: row.cents / 100,
+      currency: "EUR",
+      reference: row.reference,
+      instant: true
+    )
+
+  let txResult = makeBatchTransfer(
+    url = cfg.fintsUrl,
+    blz = cfg.blz,
+    user = cfg.user,
+    pin = cfg.pin,
+    productId = ProductId,
+    senderIban = cfg.iban,
+    senderBic = cfg.bic,
+    senderName = cfg.accountHolder,
+    payments = payments,
+    ui = finzHooks(l)
+  )
+
+  if txResult.success:
+    return 0
+
+  var msg = "batch failed"
+  if txResult.errorCode.len > 0 and txResult.errorMsg.len > 0:
+    msg &= ": " & txResult.errorCode & " " & txResult.errorMsg
+  elif txResult.errorMsg.len > 0:
+    msg &= ": " & txResult.errorMsg
+  elif txResult.errorCode.len > 0:
+    msg &= ": " & txResult.errorCode
+  stderr.writeLine "payf: " & msg
+  hintLog(l)
+  return 5
+
 proc balance(
     conf: string = "",
     verbose: bool = false
 ): int =
-  ## Query account balance (not yet implemented).
+  ## Query account balance (HKSAL / HISAL).
   let cfg = loadValidConfig(conf)
-  discard cfg
-  stderr.writeLine "payf: balance not yet implemented"
-  return 1
+
+  let l = initLogger(verbose)
+  defer: l.close()
+  l.info("balance query")
+
+  let balResult = fetchBalance(
+    url = cfg.fintsUrl,
+    blz = cfg.blz,
+    user = cfg.user,
+    pin = cfg.pin,
+    productId = ProductId,
+    iban = cfg.iban,
+    bic = cfg.bic,
+    ui = finzHooks(l)
+  )
+
+  if not balResult.success:
+    var msg = "balance failed"
+    if balResult.errorCode.len > 0 and balResult.errorMsg.len > 0:
+      msg &= ": " & balResult.errorCode & " " & balResult.errorMsg
+    elif balResult.errorMsg.len > 0:
+      msg &= ": " & balResult.errorMsg
+    elif balResult.errorCode.len > 0:
+      msg &= ": " & balResult.errorCode
+    stderr.writeLine "payf: " & msg
+    hintLog(l)
+    return 5
+
+  echo formatAmount(balResult.saldo.balance) & " " & balResult.saldo.currency
+  return 0
 
 proc list(
     args: seq[string],
@@ -238,6 +347,12 @@ when isMainModule:
       "instant": "use instant transfer (default: on)",
       "conf": "path to payf.conf (default: ./payf.conf, else ~/.config/payf/payf.conf)",
       "dryRun": "don't actually send",
+      "verbose": "mirror bank protocol to stderr"
+    }],
+    [batch, cmdName = "batch", help = {
+      "args": "FILE  TSV: NAME<TAB>IBAN<TAB>AMOUNT[<TAB>REFERENCE]",
+      "conf": "path to payf.conf (default: ./payf.conf, else ~/.config/payf/payf.conf)",
+      "dryRun": "validate and log only, don't send",
       "verbose": "mirror bank protocol to stderr"
     }],
     [list, cmdName = "list", help = {

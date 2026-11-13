@@ -71,6 +71,11 @@ payf transfer "Recipient" IBAN 10.00 --reference "Payment"
 # Standard (non-instant) transfer
 payf transfer "Recipient" IBAN 10.00 --instant=false
 
+# Several instant transfers as one batch, one TAN for the whole batch
+# (SEPA-Sammelüberweisung, HKIPM — instant only, no non-instant fallback)
+printf 'name\tiban\tamount\treference\nErika\tDE75512108001245126199\t10,00\trent\n' > rent.tsv
+payf batch rent.tsv
+
 # Dry run
 payf transfer "Recipient" IBAN 10.00 --dry-run
 

@@ -2,6 +2,7 @@
 
 import std/[os, unittest, strutils, times]
 import ../src/payf/amounts
+import ../src/payf/batchfile
 import ../src/payf/dates
 import ../src/payf/update
 import ../src/payf/config
@@ -106,6 +107,31 @@ suite "iban validation":
     check validateIban("DE7570000000071101002").len > 0
     check validateIban("DE75 7000 0000 0071 1010 02").len > 0
 
+suite "bic validation":
+  test "valid bics pass":
+    check validateBic("MARKDEF1750") == ""
+    check validateBic("GENODEF1XXX") == ""
+    check validateBic("BYLADEM1001") == ""
+    check validateBic("MARKDEF1") == ""
+    check validateBic("") == ""
+
+  test "truncated bic rejected":
+    # MARKDEF1750 without its final digit; the 10-character BIC
+    # misrouted the VoP payee lookup into a 3040 loop ending in 9000
+    let err = validateBic(normalizeBic("MARKDEF175"))
+    check err.contains("expected 8 or 11 characters")
+    check err.contains("MARKDEF175")
+
+  test "structural rejects":
+    check validateBic("MARKDEF17500").len > 0  # 12 chars
+    check validateBic("1ARKDEF1750").len > 0    # digit in bank code
+    check validateBic("MARKDEF17#0").len > 0    # non-alphanumeric character
+    check validateBic("markdef1 750").len > 0   # must be normalized first
+
+  test "normalize strips grouping and case":
+    check normalizeBic("markdef1 750") == "MARKDEF1750"
+    check normalizeBic(" GENODEF1XXX ") == "GENODEF1XXX"
+
 suite "config loading":
   test "reads payf.conf, env overrides":
     let dir = getTempDir() / "payf-test-conf"
@@ -152,6 +178,16 @@ account_holder=Max Mustermann
     check cfg.fintsUrl == ""
     check cfg.validate().len == 5
 
+  test "config with broken sender bic":
+    let dir = getTempDir() / "payf-test-bad-bic"
+    removeDir(dir)
+    createDir(dir)
+    let conf = dir / "payf.conf"
+    writeFile(conf, "bic = MARKDEF175\n")
+    let cfg = loadConfig(conf)
+    check validateBic(cfg.bic).contains("expected 8 or 11 characters")
+    removeDir(dir)
+
   test "config with broken sender iban":
     let dir = getTempDir() / "payf-test-bad-iban"
     removeDir(dir)
@@ -187,6 +223,54 @@ suite "conf file cascade":
     setCurrentDir(oldDir)
     delEnv("XDG_CONFIG_HOME")
     removeDir(dir)
+
+suite "batch file parsing":
+  test "valid rows with header, comments, blank lines":
+    let text = ["# monthly run",
+                "name\tiban\tamount\treference",
+                "",
+                "Erika Musterfrau\tde75 5121 0800 1245 1261 99\t100,50\tInvoice 1",
+                "Bob\tDE02120300000000202051\t10\t"].join("\n")
+    let f = parseBatchFile(text)
+    check f.err == ""
+    check f.rows.len == 2
+    check f.rows[0].name == "Erika Musterfrau"
+    check f.rows[0].iban == "DE75512108001245126199"  # normalized
+    check f.rows[0].cents == 10050
+    check f.rows[0].reference == "Invoice 1"
+    check f.rows[1].reference == ""
+    check f.totalCents == 11050
+
+  test "reference may contain tabs (last field takes the rest)":
+    let f = parseBatchFile("Bob\tDE02120300000000202051\t10\ta\tb")
+    check f.err == ""
+    check f.rows[0].reference == "a\tb"
+
+  test "bad iban fails with line number":
+    let f = parseBatchFile("A\tDE02120300000000202051\t1\t\nB\tDE99\t2\t")
+    check f.err.startsWith("line 2: invalid iban")
+
+  test "bad amount fails with line number":
+    let f = parseBatchFile("A\tDE02120300000000202051\t1.000\t")
+    check f.err.startsWith("line 1: ")
+    check "ambiguous" in f.err
+
+  test "too few fields fails":
+    let f = parseBatchFile("Just A Name\tDE02120300000000202051")
+    check f.err == "line 1: expected NAME, IBAN, AMOUNT[, REFERENCE]"
+
+  test "non-positive amount fails":
+    let f = parseBatchFile("A\tDE02120300000000202051\t0\t")
+    check f.err == "line 1: amount must be greater than 0"
+
+  test "oversized reference fails":
+    let f = parseBatchFile("A\tDE02120300000000202051\t1\t" & repeat('x', 141))
+    check "reference longer than 140" in f.err
+
+  test "empty file has no payments":
+    let f = parseBatchFile("# nothing\n")
+    check f.err == ""
+    check f.rows.len == 0
 
 suite "output field escaping":
   test "tab-separated replaces separator":

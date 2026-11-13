@@ -41,6 +41,33 @@ proc normalizeIban*(iban: string): string =
     if not c.isSpaceAscii: result.add c
   result = toUpperAscii(result)
 
+proc normalizeBic*(bic: string): string =
+  ## BICs printed on invoices sometimes come grouped or lowercase;
+  ## strip whitespace and uppercase so pasted values work verbatim
+  ## (config and argv both).
+  for c in bic:
+    if not c.isSpaceAscii: result.add c
+  result = toUpperAscii(result)
+
+proc validateBic*(bic: string): string =
+  ## Check BIC structure (ISO 9362): 6 letters + 2 alphanumeric
+  ## location, optionally + 3 alphanumeric branch, so 8 or 11
+  ## characters total. A truncated BIC (MARKDEF175 for MARKDEF1750)
+  ## misroutes the VoP payee lookup: the bank polls until it gives up
+  ## with a raw 9000. Input must already be normalized; "" is valid so
+  ## an optional BIC stays unset.
+  if bic.len == 0: return ""
+  if bic.len != 8 and bic.len != 11:
+    return "expected 8 or 11 characters, got " & $bic.len & ": " & bic
+  for i, c in bic:
+    let alpha = c.isAlphaAscii
+    if i < 6:
+      if not alpha or not c.isUpperAscii:
+        return "first 6 characters must be letters: " & bic
+    elif not c.isAlphaNumeric:
+      return "only letters and digits allowed: " & bic
+  return ""
+
 proc validateIban*(iban: string): string =
   ## Check IBAN structure and the ISO 13616 mod-97 checksum. Returns ""
   ## when valid, else a human-readable reason. Catches truncated or
@@ -100,7 +127,7 @@ proc loadConfig*(confFile: string = ""): Config =
     user: value("fints_user", "FINTS_USER"),
     pin: pin,
     iban: normalizeIban(value("iban", "IBAN")),
-    bic: value("bic", "BIC"),
+    bic: normalizeBic(value("bic", "BIC")),
     accountHolder: value("account_holder", "ACCOUNT_HOLDER"),
     test: value("test", "TEST", "1") == "1"
   )
