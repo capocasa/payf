@@ -1,6 +1,6 @@
 # Package
 
-version       = "0.1.1"
+version       = "0.1.2"
 author        = "payf"
 description   = "FinTS CLI for SEPA instant transfers"
 license       = "MIT"
